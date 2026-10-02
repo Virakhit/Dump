@@ -59,6 +59,8 @@ The repository's `TAURI_SIGNING_PRIVATE_KEY` Actions secret holds the updater si
 
 GitHub Actions needs permission to write repository contents; branch protection must permit the manifest commit. An older or equal app version never replaces the update channel. If publishing manually, include the signed installer, its signature, and Tauri's generated `latest.json` before publishing; uploading source code alone does not update installed apps.
 
+To retry packaging an existing unpublished tag after a workflow correction, use **Actions > Windows release > Run workflow**, enter that tag, and run from `main`. This also handles tags whose source commit intentionally skipped push CI; it does not move or rewrite the tag.
+
 ```powershell
 cargo test --manifest-path src-tauri/Cargo.toml --features updater-tests --test updater --locked
 cargo test --manifest-path src-tauri/Cargo.toml --lib --locked

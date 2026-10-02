@@ -4,6 +4,12 @@ on:
     tags: ['v*']
   release:
     types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing version tag to package
+        required: true
+        type: string
 permissions:
   contents: write
 concurrency:
@@ -11,10 +17,12 @@ concurrency:
   cancel-in-progress: false
 jobs:
   build:
-    if: github.event_name == 'push'
+    if: github.event_name != 'release'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
       - uses: actions/setup-node@v4
         with:
           node-version: 24
@@ -25,21 +33,22 @@ jobs:
         shell: pwsh
         env:
           SIGNING_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           if (-not $env:SIGNING_KEY) { throw 'Set the TAURI_SIGNING_PRIVATE_KEY repository secret before releasing.' }
           $version = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
-          if ($env:GITHUB_REF_NAME -notmatch ('^v' + [regex]::Escape($version) + '(-alpha\.[0-9]+)?$')) { throw 'The tag must match the application version.' }
+          if ($env:RELEASE_TAG -notmatch ('^v' + [regex]::Escape($version) + '(-alpha\.[0-9]+)?$')) { throw 'The tag must match the application version.' }
       - uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
-          tagName: ${{ github.ref_name }}
-          releaseName: Dump ${{ github.ref_name }}
+          tagName: ${{ inputs.tag || github.ref_name }}
+          releaseName: Dump ${{ inputs.tag || github.ref_name }}
           releaseBody: 'Windows x64 installer with signed in-app updates. Preview releases remain alpha; Windows publisher signing and physical-machine validation are still pending.'
           releaseDraft: true
-          prerelease: ${{ contains(github.ref_name, '-alpha.') }}
+          prerelease: ${{ contains(inputs.tag || github.ref_name, '-alpha.') }}
           updaterJsonPreferNsis: true
           args: -- --locked
   announce:
