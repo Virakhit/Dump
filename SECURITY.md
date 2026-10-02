@@ -30,6 +30,10 @@ Run core/integration tests, desktop build, dependency review, source secret scan
 
 Protect the Windows profile: there is no v0.1 key recovery/export. Losing the owner identity prevents future member administration; existing members with intact identities and the last accepted roster can still transfer until they choose to stop.
 
+## App updates
+
+Update checks are explicitly requested by the user and fetch a public HTTPS manifest from this repository's `main` branch. Installers come from GitHub Releases. The native Tauri updater verifies the pinned public key and requires the signed version to match the manifest before installation; it rejects older/equal versions. The UI cannot provide an arbitrary update URL or key through IPC. Private signing keys stay outside Git and in repository Actions secrets. Updates wait for file preparation and active transfers to finish, then restart the application using the current-user NSIS installer. This signature does not supply a Windows Authenticode publisher certificate. LAN file sharing remains independent of update checks.
+
 ## Reporting
 
 Report suspected vulnerabilities privately through [GitHub security advisories](https://github.com/Virakhit/Dump/security/advisories/new). Private vulnerability reporting is enabled for this repository. Do not publish real invite tokens, private keys, workspace secrets, user files, local paths, or personal network captures in an issue or report.

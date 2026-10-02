@@ -3,15 +3,15 @@
 A Windows desktop app for sharing files directly with trusted people on the same local network.
 Files stay on the owner's device until another member receives them. No account, cloud file storage, or Dump backend is required.
 
-**Status:** v0.1.0 alpha. The initial target is Windows 11 x64 and small groups of friends or teammates. See [verification results](docs/VERIFICATION.md) for tested behavior and outstanding release checks.
+**Status:** v0.1.1 alpha. The initial target is Windows 11 x64 and small groups of friends or teammates. See [verification results](docs/VERIFICATION.md) for tested behavior and outstanding release checks.
 
 ## Install on Windows
 
-**[Download the Windows installer](https://github.com/Virakhit/Dump/releases/download/v0.1.0-alpha.1/Dump_0.1.0_x64-setup.exe)** — approximately 209 MiB.
+**[Download the Windows installer](https://github.com/Virakhit/Dump/releases/download/v0.1.1-alpha.1/Dump_0.1.1_x64-setup.exe)** — Windows x64.
 
-[Release notes and checksum](https://github.com/Virakhit/Dump/releases/tag/v0.1.0-alpha.1). Download the `.exe` installer from the release assets; the source-code ZIP is for developers.
+[Release notes and updater signature](https://github.com/Virakhit/Dump/releases/tag/v0.1.1-alpha.1). Download the `.exe` installer from the release assets; the source-code ZIP is for developers.
 
-1. Download and run `Dump_0.1.0_x64-setup.exe` on each Windows device.
+1. Download and run `Dump_0.1.1_x64-setup.exe` on each Windows device.
 2. Click **Next**, choose an installation folder, and click **Install**. Dump installs for the current Windows user.
 3. On the final wizard screen, leave **Run Dump** selected and click **Finish**.
 4. Later, open **Dump** from the Windows Start Menu or the desktop shortcut if you chose to create one.
@@ -19,6 +19,12 @@ Files stay on the owner's device until another member receives them. No account,
 **No terminal commands are needed to use the installed app.** The installer includes the compiled application, its interface, and the WebView2 offline installer. End users do not need Node.js, npm, Rust, or a development server.
 
 The current alpha installer is unsigned. Silent installation and launch from the installed folder have passed on the development Windows machine; a clean Windows machine and interactive wizard navigation still require verification. To uninstall, use Windows **Settings > Apps > Installed apps > Dump**.
+
+## Update the app
+
+Click **Check for updates** in the sidebar. If a newer release is available, finish any transfers and click **Update to …**. Dump downloads it from GitHub, verifies its signature and signed version, then closes and restarts through the installer. Your device identity and workspaces are kept. Checks happen only when you click the button and require internet access; file sharing stays on the LAN.
+
+Updates follow published GitHub releases, including alpha previews. A draft release does not announce an update. Version 0.1.0 does not contain an updater: install 0.1.1 manually once to enable future in-app updates.
 
 ## Share your first file
 
@@ -46,7 +52,7 @@ Sharing does not duplicate the original file. Files being hashed or served are t
 - Protocol safety ceilings: 128 members per workspace, 10,000 advertised files, 100 queued/active transfers, 32 pending join requests, and 128 live invite records.
 - The initial product target is small groups of up to ten devices. Protocol ceilings are defensive bounds, not tested capacity claims.
 - LAN clients must be able to reach each other. Wi-Fi guest/client isolation or blocked UDP/multicast may prevent discovery. Use the network's approved firewall configuration; Dump does not disable protection or create port-forwarding rules.
-- Internet discovery, NAT traversal, relays, resume, folders, previews, automatic updates, and telemetry are not implemented.
+- Internet discovery, NAT traversal, relays, resume, folders, previews, background update checks, and telemetry are not implemented. App updates use GitHub only after you request a check.
 
 ## Troubleshooting
 

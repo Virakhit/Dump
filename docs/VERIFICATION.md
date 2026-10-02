@@ -19,6 +19,17 @@ This records checks on the development Windows machine, not approval for a publi
 
 ## Artifact
 
+## Updater verification — 0.1.1
+
+- Frontend build, Rust formatting, and Clippy passed locally after adding the native updater.
+- Real Tauri updater requests over loopback passed: older/equal versions return no update, the signed fixture downloads successfully, tampered bytes fail verification, and an inflated manifest version paired with the earlier signed version is rejected.
+- Desktop guard test passed: queued/active transfers and file preparation block installation; completed/cancelled/failed transfers do not.
+- Node's built-in test runner verified release announcement, refusal of incomplete/unsigned manifests and unexpected installer URLs, matching tags, and prevention of channel rollback.
+- The shipping configuration requires HTTPS and the version covered by the pinned public-key signature. HTTP is enabled only in the isolated updater test context.
+- Full installation/restart through the in-app update button and clean-machine updater behavior remain unverified. The 0.1.0 installer below predates this feature and needs a one-time manual upgrade.
+
+## Original 0.1.0 artifact
+
 `src-tauri/target/release/bundle/nsis/Dump_0.1.0_x64-setup.exe` is a Windows x64, current-user NSIS installer with the WebView2 offline installer bundled. The application/installer are unsigned. Bundling passed; installation on a clean machine has not been tested.
 
 Final installer: 219,279,799 bytes. SHA-256: `c35eb85ecf6df7e892cc95f83f6cf0d8a6b20fbaac2c983b2ba93fbfbc83b258`. An adjacent `.sha256` file contains the same checksum.

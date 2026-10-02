@@ -5,11 +5,133 @@ use crate::{
 use tauri::{Emitter, Manager};
 use tauri_plugin_deep_link::DeepLinkExt;
 use tauri_plugin_dialog::DialogExt;
+use tauri_plugin_updater::{Update, UpdaterExt};
 use uuid::Uuid;
 
 struct Desktop {
     shared: Shared,
     node: Node,
+}
+
+#[derive(Default)]
+struct Updates(tokio::sync::Mutex<Option<Update>>);
+
+#[derive(Clone, serde::Serialize)]
+struct UpdateProgress {
+    downloaded: u64,
+    total: Option<u64>,
+}
+
+#[tauri::command]
+async fn check_update(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Updates>,
+) -> Result<Option<String>, String> {
+    let mut cached = state.0.lock().await;
+    *cached = None;
+    let mut update = app
+        .updater_builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| e.to_string())?
+        .check()
+        .await
+        .map_err(|e| {
+            format!(
+                "Could not check for updates. Check your internet connection and try again. {e}"
+            )
+        })?;
+    if let Some(update) = &mut update {
+        // The offline WebView2 installer makes this a large download on slower connections.
+        update.timeout = Some(std::time::Duration::from_secs(15 * 60));
+    }
+    let version = update.as_ref().map(|u| u.version.clone());
+    *cached = update;
+    Ok(version)
+}
+
+fn update_ready(engine: &Engine) -> Result<(), String> {
+    if !engine.preparing.is_empty()
+        || engine
+            .transfers
+            .values()
+            .any(|t| !matches!(t.status.as_str(), "Completed" | "Cancelled" | "Failed"))
+    {
+        return Err("Finish or cancel your transfers before updating.".into());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn updates_wait_for_transfers_and_file_preparation() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared = Engine::open(directory.path(), std::sync::Arc::new(|_| {})).unwrap();
+        let mut engine = shared.lock().await;
+        assert!(update_ready(&engine).is_ok());
+        engine.preparing.push("file".into());
+        assert!(update_ready(&engine).is_err());
+        engine.preparing.clear();
+        let id = Uuid::new_v4();
+        engine.transfers.insert(
+            id,
+            engine::Transfer {
+                id,
+                file_id: id,
+                name: "file".into(),
+                peer_id: "peer".into(),
+                direction: "Receiving".into(),
+                bytes: 0,
+                total: 1,
+                status: "Queued".into(),
+                error: None,
+            },
+        );
+        for status in ["Queued", "Connecting", "Receiving", "Sending"] {
+            engine.transfers.get_mut(&id).unwrap().status = status.into();
+            assert!(update_ready(&engine).is_err());
+        }
+        for status in ["Completed", "Cancelled", "Failed"] {
+            engine.transfers.get_mut(&id).unwrap().status = status.into();
+            assert!(update_ready(&engine).is_ok());
+        }
+    }
+}
+
+#[tauri::command]
+async fn install_update(
+    state: tauri::State<'_, Updates>,
+    desktop: tauri::State<'_, Desktop>,
+    version: String,
+    on_progress: tauri::ipc::Channel<UpdateProgress>,
+) -> Result<(), String> {
+    update_ready(&*desktop.shared.lock().await)?;
+    let mut cached = state.0.lock().await;
+    let update = cached
+        .as_ref()
+        .filter(|u| u.version == version)
+        .ok_or("Check for updates again before installing.")?;
+    let mut downloaded = 0;
+    // The platform updater verifies the pinned signing key before returning these bytes.
+    let bytes = update
+        .download(
+            |length, total| {
+                downloaded += length as u64;
+                let _ = on_progress.send(UpdateProgress { downloaded, total });
+            },
+            || {},
+        )
+        .await
+        .map_err(|e| format!("Update download or signature verification failed: {e}"))?;
+    update_ready(&*desktop.shared.lock().await)?;
+    update
+        .install(bytes)
+        .map_err(|e| format!("Could not start the update installer: {e}"))?;
+    *cached = None;
+    Ok(())
 }
 
 #[tauri::command]
@@ -112,6 +234,8 @@ pub fn run() {
         }))
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .manage(Updates::default())
         .setup(|app| {
             let handle = app.handle().clone();
             let shared = Engine::open(
@@ -142,7 +266,9 @@ pub fn run() {
             dispatch,
             choose_share_files,
             share_dropped_files,
-            receive_file
+            receive_file,
+            check_update,
+            install_update
         ])
         .run(tauri::generate_context!())
         .expect("Dump could not start; check local data permissions and networking");

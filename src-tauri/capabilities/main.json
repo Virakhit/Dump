@@ -3,5 +3,5 @@
   "identifier": "main",
   "description": "Bundled Dump UI: events only; OS drop paths are passed to Rust validation, and file dialogs remain in Rust.",
   "windows": ["main"],
-  "permissions": ["core:event:default"]
+  "permissions": ["core:event:default", "core:app:allow-version"]
 }
