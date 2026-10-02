@@ -510,7 +510,9 @@ Rust Core
 
 ### Later Versions
 
-Possible progression:
+The requested v0.2 milestone now includes Internet direct connectivity, NAT traversal and encrypted community relay fallback, delivered in the small stages recorded in `docs/PLAN.md`. Public/private address observations must be verified before advertisement; invitations will carry signed contact locators through a trusted channel rather than public workspace discovery. No mandatory Dump backend is introduced, and existing identities, membership signatures and LAN operation remain compatible. This is a requested target, not a claim that every stage is implemented.
+
+Earlier possible progression (superseded for the v0.2 connectivity milestone):
 
 ```text
 v0.2

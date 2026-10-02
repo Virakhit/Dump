@@ -4,7 +4,7 @@
 
 English Windows LAN desktop for friends/general users. Core loop: create workspace, invite, compare fingerprint, approve device, share, receive, verify. Workspaces have a single creator; existing members transfer while that creator is offline. Member removal is eventual on receipt of signed membership, not instant during partitions.
 
-Original requirements: `requirement.md`. Decisions from the planning conversation are preserved here; the source requirements remain unchanged.
+Original requirements: `requirement.md`. Decisions from the planning conversation and the requested v0.2 Internet milestone are preserved here.
 
 ## Architecture decisions
 
@@ -41,6 +41,21 @@ Complete these before calling the build a validated beta. Source builds and loop
 
 The local implementation has passed a separate 8 GiB loopback test; target-machine memory observations and multi-machine behavior remain unverified. See `VERIFICATION.md` for executed checks.
 
-## Later
+## v0.2 Internet milestone
 
-Keep Internet direct, NAT traversal, community relays, resume, folders, chat, previews, and telemetry out of v0.1. Revisit Internet discovery only after LAN usage demonstrates value; it requires reachable bootstrap information and real network tests. Do not promise universal NAT/CGNAT connectivity or treat a forwarding relay as file storage.
+The implementation proceeds in small stages; the published 0.1.1 installer remains the LAN alpha. Priority: security, correctness, interoperability, UX, then optimization. The protocol's contact decision is in `PROTOCOL.md`; no mandatory backend, global workspace discovery, accounts, storage, telemetry or UI rewrite.
+
+| Stage | Work / files | Status |
+|---|---|---|
+| 1 | Identify, bounded IP/QUIC address registration and expected-identity dialing, candidate observations and diagnostics. `connectivity.rs`, `network.rs`, Cargo feature/lock, unit and network tests. | Implemented; verification recorded in `VERIFICATION.md`. Core API only; no Internet invitation UI yet. |
+| 2 | AutoNAT or equivalent reachability verification, candidate expiry, public address advertisement and no external requirement for LAN. Connectivity/network tests. | Pending |
+| 3 | Configurable relay client, reservation renewal/failure, E2E Noise + Yamux circuit transport, existing application protocols and adversarial integration tests. | Pending |
+| 4 | DCUtR direct upgrade and routing preference, retain relay fallback without breaking active transfers. | Pending |
+| 5 | Opt-in relay peer role, reservation/circuit/bandwidth/bytes/rate ceilings and self-host instructions. Settings persisted with defaults; desktop typed IPC and small UI checkbox. | Pending |
+| 6 | Bounded signed contact records, invitation parsing/creation, authorized member contact exchange and reconnection. Preserve v1 identities/rosters; minimal direct/relay/connecting/offline UI states. | Pending |
+
+After every stage: core Rust tests, desktop tests/build checks, frontend build, Rustfmt and configured Clippy with warnings denied. Record failures and actual evidence; do not promote candidates or describe planned features as shipped.
+
+Final local regression matrix: LAN/mDNS; explicit direct address; existing protocols through relay; relay identity cannot grant membership; corrupted data fails before commit; wrong Peer ID; unauthorized catalog; unauthorized download; relay loss cleans partial transfer; direct preference; DCUtR upgrade where testable; relay resource ceilings. No public network service in these tests. Loopback test routes simulate explicit Internet address dialing; they do not establish real NAT traversal success. Separate physical cross-network/firewall/CGNAT checks remain necessary before distribution claims.
+
+Resume, folders, chat, previews, telemetry, permanent hosting, WebRTC, Tor, blockchain and public file search remain outside this milestone. Never promise universal NAT/CGNAT connectivity or treat a forwarding relay as file storage.

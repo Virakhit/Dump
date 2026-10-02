@@ -2,6 +2,15 @@
 
 This records checks on the development Windows machine, not approval for a public beta.
 
+## v0.2 Stage 1 — Identify and explicit direct dialing
+
+- `cargo test --manifest-path src-tauri/Cargo.toml --no-default-features --locked`: 11 passed (four unit, three connectivity integration, four existing LAN integration); the existing 8 GiB test remains intentionally ignored and was not repeated for this stage.
+- New integration checks passed: explicit literal-IP QUIC dial using a loopback simulation; Identify exchange with no interface address advertisement or loopback public candidate; real mDNS discovery of an invited owner without explicit addresses, followed by approval; matching-address suffix validation and wrong expected identity handshake rejection; catalog and file-header denial to an authenticated nonmember; clean offline diagnostics after the remote shuts down.
+- New unit checks passed: direct-address shape/port/IP/identity checks, deduplication and 256-peer/eight-address bounds; conservative public/private/CGNAT/reserved IPv4 and IPv6 candidate filtering.
+- `cargo test --manifest-path src-tauri/Cargo.toml --lib --locked`: five passed, including the updater active-transfer/preparation guard.
+- `npm.cmd run build`, Rustfmt check, `git diff --check`, and configured Clippy (`--all-targets --locked -- -D warnings`) passed. Existing LAN transfer, owner-offline, eventual revocation, persistence, pagination and cancellation tests passed with Identify enabled.
+- No public service, real Internet route, NAT gateway or relay was used. This establishes core direct-dial and local discovery behavior, not cross-network end-user availability. AutoNAT, relays, DCUtR, new invitation contacts and opt-in network assistance remain pending. No new installer was built or published; the existing signed updater/0.1.1 installer is unchanged. This stage changes no persisted identity/workspace or signed membership/manifest format.
+
 ## Passed
 
 - TypeScript and Vite production build.

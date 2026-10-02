@@ -1,4 +1,8 @@
 use crate::{
+    connectivity::{
+        diagnostic, direct_address, public_address, AddressBook, ConnectionState, Diagnostics,
+        DialFailure, MAX_ADDRESSES,
+    },
     engine::{open_source, refresh_share, stamp, Shared},
     model::*,
     storage::commit_download,
@@ -6,8 +10,11 @@ use crate::{
 use anyhow::{bail, ensure, Context, Result};
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, StreamExt};
 use libp2p::{
-    connection_limits, mdns, ping,
-    swarm::{behaviour::toggle::Toggle, NetworkBehaviour, Stream, StreamProtocol, SwarmEvent},
+    connection_limits, identify, mdns, ping,
+    swarm::{
+        behaviour::toggle::Toggle, dial_opts::DialOpts, DialError, NetworkBehaviour, Stream,
+        StreamProtocol, SwarmEvent,
+    },
     Multiaddr, PeerId, SwarmBuilder,
 };
 use libp2p_stream::Control;
@@ -21,7 +28,7 @@ use std::{
 };
 use tokio::{
     io::{AsyncReadExt as DiskRead, AsyncWriteExt as DiskWrite},
-    sync::{mpsc, watch, Mutex, Semaphore},
+    sync::{mpsc, oneshot, watch, Mutex, Semaphore},
 };
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -36,6 +43,7 @@ struct Behaviour {
     streams: libp2p_stream::Behaviour,
     mdns: Toggle<mdns::tokio::Behaviour>,
     ping: ping::Behaviour,
+    identify: identify::Behaviour,
     limits: connection_limits::Behaviour,
 }
 
@@ -137,12 +145,19 @@ impl Limits {
     }
 }
 
+struct Dial {
+    peer: PeerId,
+    address: Multiaddr,
+    reply: oneshot::Sender<Result<()>>,
+}
+
 #[derive(Clone)]
 pub struct Node {
     pub shared: Shared,
     pub control: Control,
-    dial: mpsc::Sender<(PeerId, Multiaddr)>,
+    dial: mpsc::Sender<Dial>,
     pub addresses: watch::Receiver<Vec<Multiaddr>>,
+    pub diagnostics: watch::Receiver<Diagnostics>,
     limits: Arc<Limits>,
     pub shutdown: CancellationToken,
 }
@@ -158,13 +173,21 @@ impl Node {
         let mut swarm = SwarmBuilder::with_existing_identity(key)
             .with_tokio()
             .with_quic()
-            .with_behaviour(|_| Behaviour {
+            .with_behaviour(|key| Behaviour {
                 streams: libp2p_stream::Behaviour::new(),
                 mdns: mdns.into(),
                 ping: ping::Behaviour::new(
                     ping::Config::new()
                         .with_interval(Duration::from_secs(5))
                         .with_timeout(Duration::from_secs(5)),
+                ),
+                identify: identify::Behaviour::new(
+                    identify::Config::new("/dump/1".into(), key.public())
+                        .with_agent_version(format!("dump/{}", env!("CARGO_PKG_VERSION")))
+                        // Never leak interface addresses to Internet peers or cache their
+                        // unchecked routing hints. mDNS remains independent for LAN peers.
+                        .with_hide_listen_addrs(true)
+                        .with_cache_size(0),
                 ),
                 limits: connection_limits::Behaviour::new(
                     connection_limits::ConnectionLimits::default()
@@ -191,6 +214,7 @@ impl Node {
         let mut files = control.accept(FILE)?;
         let (dial, mut dials) = mpsc::channel(128);
         let (address_tx, addresses) = watch::channel(Vec::new());
+        let (diagnostic_tx, diagnostics) = watch::channel(Diagnostics::new());
         let limits = Arc::new(Limits::new());
         let shutdown = CancellationToken::new();
         let node = Self {
@@ -198,6 +222,7 @@ impl Node {
             control: control.clone(),
             dial,
             addresses,
+            diagnostics,
             limits: limits.clone(),
             shutdown: shutdown.clone(),
         };
@@ -205,7 +230,7 @@ impl Node {
         let incoming_slots = Arc::new(Semaphore::new(32));
         let incoming_file_slots = Arc::new(Semaphore::new(8));
         tokio::spawn(async move {
-            let mut discovered: BTreeMap<PeerId, Vec<Multiaddr>> = BTreeMap::new();
+            let mut discovered = AddressBook::default();
             let in_flight = Arc::new(Mutex::new(BTreeSet::new()));
             let mut last_join = 0;
             let mut tick = tokio::time::interval(Duration::from_secs(2));
@@ -213,10 +238,22 @@ impl Node {
             loop {
                 tokio::select! {
                     _ = shutdown.cancelled() => break,
-                    Some((peer, address)) = dials.recv() => {
-                        discovered.entry(peer).or_default().push(address.clone());
-                        swarm.add_peer_address(peer, address.clone());
-                        let _ = swarm.dial(address.with(libp2p::multiaddr::Protocol::P2p(peer)));
+                    Some(Dial { peer, address, reply }) = dials.recv() => {
+                        let result = (|| {
+                            discovered.remember(peer, address.clone())?;
+                            swarm.add_peer_address(peer, address.clone());
+                            if !swarm.is_connected(&peer) {
+                                swarm.dial(DialOpts::peer_id(peer).addresses(vec![address]).build())?;
+                                diagnostic_tx.send_modify(|d| {
+                                    if let Some(d) = diagnostic(d, peer) {
+                                        d.state = ConnectionState::Connecting;
+                                        d.last_failure = None;
+                                    }
+                                });
+                            }
+                            Ok(())
+                        })();
+                        let _ = reply.send(result);
                     },
                     Some((peer, stream)) = incoming.next() => {
                         if let Ok(permit) = incoming_slots.clone().try_acquire_owned() {
@@ -233,15 +270,64 @@ impl Node {
                     event = swarm.select_next_some() => match event {
                         SwarmEvent::NewListenAddr { address, .. } => {
                             listeners.push(address); let _ = address_tx.send(listeners.clone());
-                            let mut e = shared.lock().await; e.network_status = "LAN discovery is running".into(); e.emit();
+                            let mut e = shared.lock().await; e.network_status = if discovery { "LAN discovery is running" } else { "Listening for direct connections" }.into(); e.emit();
+                        },
+                        SwarmEvent::ExpiredListenAddr { address, .. } => {
+                            listeners.retain(|a| a != &address); let _ = address_tx.send(listeners.clone());
                         },
                         SwarmEvent::Behaviour(BehaviourEvent::Mdns(mdns::Event::Discovered(peers))) => for (peer, address) in peers {
-                            if discovered.len() < 256 || discovered.contains_key(&peer) {
-                                let addresses = discovered.entry(peer).or_default();
-                                if addresses.len() < 8 && !addresses.contains(&address) { addresses.push(address.clone()); swarm.add_peer_address(peer, address); }
+                            if discovered.remember(peer, address.clone()).is_ok_and(|added| added) {
+                                swarm.add_peer_address(peer, address);
                             }
                         },
+                        SwarmEvent::Behaviour(BehaviourEvent::Identify(identify::Event::Received { peer_id, info, .. })) => {
+                            if info.public_key.to_peer_id() == peer_id {
+                                let observed = direct_address(peer, info.observed_addr).ok().filter(public_address);
+                                diagnostic_tx.send_modify(|d| {
+                                    if let Some(d) = diagnostic(d, peer_id) {
+                                        d.identified = true;
+                                        d.observed_address = observed;
+                                        d.advertised_addresses = info.listen_addrs.iter().take(MAX_ADDRESSES).cloned().collect();
+                                    }
+                                });
+                                // An authenticated remote may still be malicious. Learn public
+                                // hints only for already known peers; every request still authorizes.
+                                if discovered.contains(&peer_id) {
+                                    for address in info.listen_addrs.into_iter().take(MAX_ADDRESSES) {
+                                        if let Ok(address) = direct_address(peer_id, address) {
+                                            if public_address(&address) && discovered.remember(peer_id, address.clone()).is_ok_and(|added| added) {
+                                                swarm.add_peer_address(peer_id, address);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                            diagnostic_tx.send_modify(|d| {
+                                if let Some(d) = diagnostic(d, peer_id) {
+                                    d.state = ConnectionState::Direct;
+                                    d.last_failure = None;
+                                }
+                            });
+                        },
+                        SwarmEvent::OutgoingConnectionError { peer_id: Some(peer_id), error, .. } => {
+                            diagnostic_tx.send_modify(|d| {
+                                if let Some(d) = diagnostic(d, peer_id) {
+                                    if !swarm.is_connected(&peer_id) { d.state = ConnectionState::Offline; }
+                                    d.last_failure = Some(if matches!(error, DialError::WrongPeerId { .. }) { DialFailure::WrongPeer } else { DialFailure::Unreachable });
+                                }
+                            });
+                        },
                         SwarmEvent::ConnectionClosed { peer_id, num_established: 0, .. } => {
+                            diagnostic_tx.send_modify(|d| {
+                                if let Some(d) = diagnostic(d, peer_id) {
+                                    d.state = ConnectionState::Offline;
+                                    d.identified = false;
+                                    d.observed_address = None;
+                                    d.advertised_addresses.clear();
+                                }
+                            });
                             let mut e = shared.lock().await; e.online.remove(&peer_id.to_string()); e.remote.retain(|_,m| m.owner_peer_id != peer_id.to_string());
                             for (id,t) in &e.transfers { if t.peer_id == peer_id.to_string() { if let Some(c) = e.cancellations.get(id) { c.cancel(); } } }
                             e.emit();
@@ -257,8 +343,9 @@ impl Node {
                         e.pending.retain(|_,p| now().saturating_sub(p.requested_at) < 86400);
                         let joining = e.persisted.joining.clone();
                         let targets = e.active_snapshot().ok().filter(|s| s.contains(&e.peer())).map(|s| s.members.into_iter().filter_map(|m| m.peer_id.parse::<PeerId>().ok()).filter(|p| *p != peer).collect::<Vec<_>>()).unwrap_or_default();
+                        e.network_status = if !e.online.is_empty() { "Connected directly" } else if joining.is_some() { "Connecting…" } else if listeners.is_empty() { "Offline" } else if discovery { "LAN discovery is running" } else { "Listening for direct connections" }.into();
                         e.emit(); drop(e);
-                        for target in targets.into_iter().filter(|p| discovered.contains_key(p)) {
+                        for target in targets.into_iter().filter(|p| discovered.contains(p)) {
                             let mut ongoing = in_flight.lock().await;
                             if ongoing.insert(target) {
                                 let node = poll_node.clone(); let ongoing = in_flight.clone();
@@ -269,7 +356,7 @@ impl Node {
                             if now() >= last_join + 4 {
                                 last_join = now();
                                 if let Ok(target) = invite.owner_peer_id.parse::<PeerId>() {
-                                    if discovered.contains_key(&target) {
+                                    if discovered.contains(&target) {
                                         let mut ongoing = in_flight.lock().await;
                                         if ongoing.insert(target) { let node = poll_node.clone(); let ongoing = in_flight.clone(); tokio::spawn(async move { let _ = node.poll_join(invite).await; ongoing.lock().await.remove(&target); }); }
                                     }
@@ -287,6 +374,7 @@ impl Node {
             e.remote.clear();
             e.network_status = "Offline".into();
             e.emit();
+            diagnostic_tx.send_modify(|d| d.clear());
         });
         let refresh_shared = node.shared.clone();
         let refresh_shutdown = node.shutdown.clone();
@@ -322,8 +410,17 @@ impl Node {
         Ok(node)
     }
     pub async fn connect(&self, peer: PeerId, address: Multiaddr) -> Result<()> {
-        self.dial.send((peer, address)).await?;
-        Ok(())
+        let address = direct_address(peer, address)?;
+        let (reply, registered) = oneshot::channel();
+        self.dial
+            .send(Dial {
+                peer,
+                address,
+                reply,
+            })
+            .await?;
+        // Acknowledges registration, not connection success; consult diagnostics for that.
+        tokio::time::timeout(PREAUTH_TIMEOUT, registered).await??
     }
     pub async fn request(&self, peer: PeerId, request: &Request) -> Result<Response> {
         let mut control = self.control.clone();

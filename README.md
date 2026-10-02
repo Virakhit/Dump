@@ -71,6 +71,8 @@ Check the network's approved firewall configuration if discovery or connections 
 
 Building from source is optional. See the [development guide](docs/DEVELOPMENT.md) for prerequisites, development commands, installer builds, and tests.
 
+The v0.2 Internet milestone is under development. Stage 1 adds Identify, bounded explicit QUIC address dialing and local connection diagnostics to the Rust core. Addresses are checked against the expected Peer ID; Identify observations are unverified candidates and do not replace workspace authorization. LAN invitations and mDNS remain available without Internet access. This is not yet an end-user cross-network release: automatic Internet invites, reachability checks, relay transport, hole punching and relay participation settings are pending in the [staged plan](docs/PLAN.md). The installer linked above remains the published LAN-only 0.1.1 build.
+
 ## Documentation
 
 - [Product requirements](requirement.md).
