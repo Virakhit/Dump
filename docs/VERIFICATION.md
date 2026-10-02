@@ -25,7 +25,10 @@ This records checks on the development Windows machine, not approval for a publi
 - Node's built-in test runner verified release announcement, refusal of incomplete/unsigned manifests and unexpected installer URLs, matching tags, and prevention of channel rollback.
 - The shipping configuration requires HTTPS and the version covered by the pinned public-key signature. HTTP is enabled only in the isolated updater test context.
 - [Remote Windows checks](https://github.com/Virakhit/Dump/actions/runs/36972960239) passed for the updater application source, including core, desktop guard, native updater, publishing tests, formatting, frontend build, and Clippy. Packaging runs separately against the version tag.
-- Full installation/restart through the in-app update button and clean-machine updater behavior remain unverified. The 0.1.0 installer below predates this feature and needs a one-time manual upgrade.
+- [Installer packaging](https://github.com/Virakhit/Dump/actions/runs/36974524963) and the [release announcement](https://github.com/Virakhit/Dump/actions/runs/36976427561) passed. Publishing `v0.1.1-alpha.2` automatically committed the public update channel on `main`, including both Windows platform aliases and public installer URLs.
+- The optional live updater check fetched the public HTTPS channel and verified all 219,912,487 bytes of the published Windows installer against its pinned key and signed version. SHA-256 of the separate downloaded installer: `074c4c81540c1ea94e7859e837644e5ab0b361911cdce00932ecf29dbe215183`.
+- Silent upgrade to 0.1.1 returned exit code 0 on the development machine. The installed executable reports product/file version 0.1.1, launched successfully, and opened its LAN UDP listeners without a development server.
+- Full installation/restart through the in-app update button and clean-machine updater behavior remain unverified. Native automation could observe the window but could not activate it or expose its controls for interaction. The 0.1.0 installer below predates this feature and needs a one-time manual upgrade.
 
 ## Original 0.1.0 artifact
 
