@@ -1,0 +1,47 @@
+[package]
+name = "dump"
+version = "0.1.0"
+edition = "2021"
+default-run = "dump"
+
+[lib]
+name = "dump_core"
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[[bin]]
+name = "dump"
+path = "src/main.rs"
+required-features = ["desktop"]
+
+[features]
+default = ["desktop"]
+desktop = ["dep:tauri", "dep:tauri-plugin-dialog", "dep:tauri-plugin-deep-link", "dep:tauri-plugin-single-instance"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+ciborium = "0.2"
+futures = "0.3"
+hex = "0.4"
+libp2p = { version = "0.57", features = ["tokio", "quic", "mdns", "ping", "macros", "ed25519"] }
+libp2p-stream = "=0.5.0-alpha"
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+tauri = { version = "2", optional = true , features = [] }
+tauri-plugin-dialog = { version = "2", optional = true }
+tauri-plugin-deep-link = { version = "2", optional = true }
+tauri-plugin-single-instance = { version = "2", features = ["deep-link"], optional = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Security_Cryptography", "Win32_Foundation", "Win32_System_Memory", "Win32_Storage_FileSystem"] }
+
+[dev-dependencies]
+tempfile = "3"
