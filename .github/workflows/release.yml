@@ -19,7 +19,7 @@ jobs:
         with:
           node-version: 24
           cache: npm
-      - run: rustup toolchain install stable --profile minimal --component clippy --component rustfmt
+      - run: rustup toolchain install stable --profile minimal
       - run: npm ci
       - name: Require the release signing key and matching version
         shell: pwsh
@@ -29,12 +29,6 @@ jobs:
           if (-not $env:SIGNING_KEY) { throw 'Set the TAURI_SIGNING_PRIVATE_KEY repository secret before releasing.' }
           $version = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
           if ($env:GITHUB_REF_NAME -notmatch ('^v' + [regex]::Escape($version) + '(-alpha\.[0-9]+)?$')) { throw 'The tag must match the application version.' }
-      - run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
-      - run: cargo test --manifest-path src-tauri/Cargo.toml --no-default-features --locked
-      - run: cargo test --manifest-path src-tauri/Cargo.toml --features updater-tests --test updater --locked
-      - run: cargo test --manifest-path src-tauri/Cargo.toml --lib --locked
-      - run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked -- -D warnings
-      - run: node --test scripts/publish-update.test.cjs
       - uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -47,7 +41,7 @@ jobs:
           releaseDraft: true
           prerelease: ${{ contains(github.ref_name, '-alpha.') }}
           updaterJsonPreferNsis: true
-          args: --locked
+          args: -- --locked
   announce:
     if: github.event_name == 'release'
     runs-on: ubuntu-latest

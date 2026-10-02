@@ -7,9 +7,9 @@ Files stay on the owner's device until another member receives them. No account,
 
 ## Install on Windows
 
-**[Download the Windows installer](https://github.com/Virakhit/Dump/releases/download/v0.1.1-alpha.1/Dump_0.1.1_x64-setup.exe)** — Windows x64.
+**[Download the Windows installer](https://github.com/Virakhit/Dump/releases/download/v0.1.1-alpha.2/Dump_0.1.1_x64-setup.exe)** — Windows x64.
 
-[Release notes and updater signature](https://github.com/Virakhit/Dump/releases/tag/v0.1.1-alpha.1). Download the `.exe` installer from the release assets; the source-code ZIP is for developers.
+[Release notes and updater signature](https://github.com/Virakhit/Dump/releases/tag/v0.1.1-alpha.2). Download the `.exe` installer from the release assets; the source-code ZIP is for developers.
 
 1. Download and run `Dump_0.1.1_x64-setup.exe` on each Windows device.
 2. Click **Next**, choose an installation folder, and click **Install**. Dump installs for the current Windows user.

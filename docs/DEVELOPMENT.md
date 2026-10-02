@@ -54,8 +54,8 @@ The repository's `TAURI_SIGNING_PRIVATE_KEY` Actions secret holds the updater si
 
 1. Increase the numeric `major.minor.patch` app version in `package.json`/`package-lock.json`, `src-tauri/Cargo.toml`/`Cargo.lock`, and `src-tauri/tauri.conf.json`. Each release must increase the app version, even for alpha previews.
 2. Commit and push, then push a matching tag (for example `v0.1.2-alpha.1` for app version `0.1.2`, or `v0.1.2` for a validated stable release).
-3. The **Windows release** workflow runs checks and creates a draft GitHub release containing the installer, `.exe.sig`, and `latest.json`.
-4. Review the notes/assets and **Publish release** on GitHub. The announce job copies the manifest to `releases/latest.json` on `main`, including for alpha releases. Existing users can now click **Check for updates** and install it.
+3. The **Windows release** workflow builds a draft GitHub release containing the installer, `.exe.sig`, and `latest.json`. Source tests run separately in **Windows checks** on `main`.
+4. Verify that **Windows checks** passed for the release's source, review the notes/assets, and **Publish release** on GitHub. The announce job copies the manifest to `releases/latest.json` on `main`, including for alpha releases. Existing users can now click **Check for updates** and install it.
 
 GitHub Actions needs permission to write repository contents; branch protection must permit the manifest commit. An older or equal app version never replaces the update channel. If publishing manually, include the signed installer, its signature, and Tauri's generated `latest.json` before publishing; uploading source code alone does not update installed apps.
 
