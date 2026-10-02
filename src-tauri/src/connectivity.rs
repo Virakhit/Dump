@@ -5,6 +5,20 @@ use std::collections::BTreeMap;
 pub const MAX_PEERS: usize = 256;
 pub const MAX_ADDRESSES: usize = 8;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ReachabilityStatus {
+    #[default]
+    Unknown,
+    Public,
+    Unreachable,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Reachability {
+    pub status: ReachabilityStatus,
+    pub public_addresses: Vec<Multiaddr>,
+}
+
 /// Local diagnostics only. A transport connection never implies workspace admission.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ConnectionState {

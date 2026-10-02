@@ -11,6 +11,14 @@ This records checks on the development Windows machine, not approval for a publi
 - `npm.cmd run build`, Rustfmt check, `git diff --check`, and configured Clippy (`--all-targets --locked -- -D warnings`) passed. Existing LAN transfer, owner-offline, eventual revocation, persistence, pagination and cancellation tests passed with Identify enabled.
 - No public service, real Internet route, NAT gateway or relay was used. This establishes core direct-dial and local discovery behavior, not cross-network end-user availability. AutoNAT, relays, DCUtR, new invitation contacts and opt-in network assistance remain pending. No new installer was built or published; the existing signed updater/0.1.1 installer is unchanged. This stage changes no persisted identity/workspace or signed membership/manifest format.
 
+## v0.2 Stage 2 — AutoNAT v2 and advertisement bounds
+
+- Core Rust suite: 13 passed (six unit, three connectivity integration and four existing LAN integration); the existing 8 GiB test was not repeated. Desktop library suite: seven passed, including the updater guard. Frontend production build, Rustfmt, diff whitespace check and configured Clippy passed.
+- Real AutoNAT v2 exchange on authenticated loopback QUIC confirmed the client's actual listener and rejected a route that could not authenticate as that client. Only the reachable route appeared in the swarm's external addresses. The harness permits loopback candidates under `cfg(test)`; shipping filtering rejects them. This is a protocol test, not a real NAT/firewall experiment.
+- Unit checks cover private/CGNAT/invalid-transport candidate exclusion, duplicate suppression and eight-candidate ceiling, no advertisement without successful evidence, local-address exclusion even after a claimed success, ten-minute confirmation expiry and withdrawal when the probe server disconnects. Existing mDNS-only join and nonmember denial checks still pass with the client enabled.
+- The first dial-back harness timed out because it omitted Identify, which AutoNAT uses to learn server protocol support. The initial broader run failed for the same reason. Adding Identify to both test swarms fixed the harness; the focused test and complete suites then passed. The shipped node already included Identify.
+- No public probe/relay/bootstrap service was contacted. AutoNAT server assistance, circuit relay transport, DCUtR, invitation contacts and real cross-network acceptance remain pending. The current bounded client does not re-probe completed candidates until all connections close; expired confirmations are withdrawn. Long-lived-session reconfirmation remains an integration item in the delivery plan.
+
 ## Passed
 
 - TypeScript and Vite production build.

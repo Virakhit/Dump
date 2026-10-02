@@ -1,10 +1,11 @@
 use crate::{
     connectivity::{
         diagnostic, direct_address, public_address, AddressBook, ConnectionState, Diagnostics,
-        DialFailure, MAX_ADDRESSES,
+        DialFailure, Reachability, ReachabilityStatus, MAX_ADDRESSES,
     },
     engine::{open_source, refresh_share, stamp, Shared},
     model::*,
+    reachability::{Client as NatClient, PublicAddresses},
     storage::commit_download,
 };
 use anyhow::{bail, ensure, Context, Result};
@@ -12,8 +13,8 @@ use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, StreamExt};
 use libp2p::{
     connection_limits, identify, mdns, ping,
     swarm::{
-        behaviour::toggle::Toggle, dial_opts::DialOpts, DialError, NetworkBehaviour, Stream,
-        StreamProtocol, SwarmEvent,
+        behaviour::toggle::Toggle, dial_opts::DialOpts, DialError, FromSwarm, NetworkBehaviour,
+        NewExternalAddrCandidate, Stream, StreamProtocol, SwarmEvent,
     },
     Multiaddr, PeerId, SwarmBuilder,
 };
@@ -44,6 +45,7 @@ struct Behaviour {
     mdns: Toggle<mdns::tokio::Behaviour>,
     ping: ping::Behaviour,
     identify: identify::Behaviour,
+    autonat: NatClient,
     limits: connection_limits::Behaviour,
 }
 
@@ -158,6 +160,7 @@ pub struct Node {
     dial: mpsc::Sender<Dial>,
     pub addresses: watch::Receiver<Vec<Multiaddr>>,
     pub diagnostics: watch::Receiver<Diagnostics>,
+    pub reachability: watch::Receiver<Reachability>,
     limits: Arc<Limits>,
     pub shutdown: CancellationToken,
 }
@@ -189,6 +192,7 @@ impl Node {
                         .with_hide_listen_addrs(true)
                         .with_cache_size(0),
                 ),
+                autonat: NatClient::new(peer),
                 limits: connection_limits::Behaviour::new(
                     connection_limits::ConnectionLimits::default()
                         .with_max_pending_incoming(Some(16))
@@ -215,6 +219,7 @@ impl Node {
         let (dial, mut dials) = mpsc::channel(128);
         let (address_tx, addresses) = watch::channel(Vec::new());
         let (diagnostic_tx, diagnostics) = watch::channel(Diagnostics::new());
+        let (reachability_tx, reachability) = watch::channel(Reachability::default());
         let limits = Arc::new(Limits::new());
         let shutdown = CancellationToken::new();
         let node = Self {
@@ -223,6 +228,7 @@ impl Node {
             dial,
             addresses,
             diagnostics,
+            reachability,
             limits: limits.clone(),
             shutdown: shutdown.clone(),
         };
@@ -235,6 +241,7 @@ impl Node {
             let mut last_join = 0;
             let mut tick = tokio::time::interval(Duration::from_secs(2));
             let mut listeners = Vec::new();
+            let mut public = PublicAddresses::default();
             loop {
                 tokio::select! {
                     _ = shutdown.cancelled() => break,
@@ -269,6 +276,9 @@ impl Node {
                     },
                     event = swarm.select_next_some() => match event {
                         SwarmEvent::NewListenAddr { address, .. } => {
+                            if public_address(&address) {
+                                swarm.behaviour_mut().autonat.on_swarm_event(FromSwarm::NewExternalAddrCandidate(NewExternalAddrCandidate { addr: &address }));
+                            }
                             listeners.push(address); let _ = address_tx.send(listeners.clone());
                             let mut e = shared.lock().await; e.network_status = if discovery { "LAN discovery is running" } else { "Listening for direct connections" }.into(); e.emit();
                         },
@@ -303,6 +313,19 @@ impl Node {
                                 }
                             }
                         },
+                        SwarmEvent::Behaviour(BehaviourEvent::Autonat(event)) => {
+                            // The library requires a matching nonce on an inbound dial-back,
+                            // not just a server's claim that an address is reachable.
+                            if let Ok(address) = direct_address(peer, event.tested_addr) {
+                                public.record(event.server, address.clone(), event.result.is_ok(), Instant::now());
+                                if event.result.is_err() { swarm.remove_external_address(&address); }
+                                let addresses = public.addresses();
+                                reachability_tx.send_replace(Reachability {
+                                    status: if !addresses.is_empty() { ReachabilityStatus::Public } else if event.result.is_err() { ReachabilityStatus::Unreachable } else { ReachabilityStatus::Unknown },
+                                    public_addresses: addresses,
+                                });
+                            }
+                        },
                         SwarmEvent::ConnectionEstablished { peer_id, .. } => {
                             diagnostic_tx.send_modify(|d| {
                                 if let Some(d) = diagnostic(d, peer_id) {
@@ -320,6 +343,12 @@ impl Node {
                             });
                         },
                         SwarmEvent::ConnectionClosed { peer_id, num_established: 0, .. } => {
+                            let expired = public.expire(Some(peer_id), Instant::now());
+                            for address in &expired { swarm.remove_external_address(address); }
+                            if !expired.is_empty() {
+                                let addresses = public.addresses();
+                                reachability_tx.send_replace(Reachability { status: if addresses.is_empty() { ReachabilityStatus::Unknown } else { ReachabilityStatus::Public }, public_addresses: addresses });
+                            }
                             diagnostic_tx.send_modify(|d| {
                                 if let Some(d) = diagnostic(d, peer_id) {
                                     d.state = ConnectionState::Offline;
@@ -336,6 +365,12 @@ impl Node {
                         _ => {},
                     },
                     _ = tick.tick() => {
+                        let expired = public.expire(None, Instant::now());
+                        for address in &expired { swarm.remove_external_address(address); }
+                        if !expired.is_empty() {
+                            let addresses = public.addresses();
+                            reachability_tx.send_replace(Reachability { status: if addresses.is_empty() { ReachabilityStatus::Unknown } else { ReachabilityStatus::Public }, public_addresses: addresses });
+                        }
                         let mut e = shared.lock().await;
                         e.online.retain(|_,seen| now().saturating_sub(*seen) < 15);
                         let active_peers: BTreeSet<_> = e.online.keys().cloned().collect();
@@ -375,6 +410,7 @@ impl Node {
             e.network_status = "Offline".into();
             e.emit();
             diagnostic_tx.send_modify(|d| d.clear());
+            reachability_tx.send_replace(Reachability::default());
         });
         let refresh_shared = node.shared.clone();
         let refresh_shutdown = node.shutdown.clone();
