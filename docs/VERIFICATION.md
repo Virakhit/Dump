@@ -17,8 +17,6 @@ This records checks on the development Windows machine, not approval for a publi
 - NSIS silent installation on the development Windows machine returned exit code 0. The installed executable, Start Menu shortcut, uninstaller registration, and `dump://` protocol command were present. The installed application launched from `%LOCALAPPDATA%/Dump/dump.exe` and displayed its bundled interface and running LAN listener while no development server was listening on ports 1420 or 4173. Its import table contains Windows system DLLs; no Node.js or Rust installation is required by the packaged executable.
 - Remote Windows frontend build, Rust formatting, and core/integration tests passed for commit `b1330b0`. The [GitHub workflow](https://github.com/Virakhit/Dump/actions/runs/36969011717) records the remaining checks and their final status.
 
-## Artifact
-
 ## Updater verification — 0.1.1
 
 - Frontend build, Rust formatting, and Clippy passed locally after adding the native updater.
