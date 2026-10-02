@@ -16,13 +16,21 @@ module.exports = async function publishUpdate({ github, context }) {
     throw new Error('Release tag and updater version differ.');
   }
   const expectedUrl = `https://github.com/${owner}/${repo}/releases/download/${tag}/Dump_${manifest.version}_x64-setup.exe`;
-  if (platform?.url !== expectedUrl || typeof platform.signature !== 'string' || !platform.signature.trim()) {
-    throw new Error('Missing signature or unexpected Windows installer URL.');
-  }
   const installer = release.assets.find(a => a.name === `Dump_${manifest.version}_x64-setup.exe`);
   const signature = release.assets.find(a => a.name === `${installer?.name}.sig`);
   if (!installer || !signature || installer.size <= 0 || signature.size <= 0) {
     throw new Error('Publish both the installer and its signature.');
+  }
+  const assetApiUrl = `https://api.github.com/repos/${owner}/${repo}/releases/assets/${installer.id}`;
+  if (!platform) throw new Error('Missing Windows update platform.');
+  for (const key of ['windows-x86_64', 'windows-x86_64-nsis']) {
+    const entry = manifest.platforms[key];
+    if (!entry) continue;
+    if (![expectedUrl, assetApiUrl].includes(entry.url) || typeof entry.signature !== 'string' || !entry.signature.trim()) {
+      throw new Error('Missing signature or unexpected Windows installer URL.');
+    }
+    // Tauri Action v1 can emit GitHub asset API URLs; publish public download URLs for both aliases.
+    entry.url = expectedUrl;
   }
   let previous;
   try {

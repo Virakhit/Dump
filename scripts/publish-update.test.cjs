@@ -9,7 +9,7 @@ test('the update channel announces complete signed releases and never moves back
   } } };
   const release = { draft: false, tag_name: 'v0.1.1-alpha.1', assets: [
     { name: 'latest.json', browser_download_url: 'https://example.test/latest.json' },
-    { name: 'Dump_0.1.1_x64-setup.exe', size: 100 }, { name: 'Dump_0.1.1_x64-setup.exe.sig', size: 100 },
+    { id: 123, name: 'Dump_0.1.1_x64-setup.exe', size: 100 }, { name: 'Dump_0.1.1_x64-setup.exe.sig', size: 100 },
   ] };
   let oldVersion, written;
   const github = { rest: { repos: {
@@ -25,6 +25,12 @@ test('the update channel announces complete signed releases and never moves back
     await publish(args);
     assert.equal(written.branch, 'main');
     assert.equal(JSON.parse(Buffer.from(written.content, 'base64')).version, '0.1.1');
+    manifest.platforms['windows-x86_64'].url = 'https://api.github.com/repos/Virakhit/Dump/releases/assets/123';
+    manifest.platforms['windows-x86_64-nsis'] = { ...manifest.platforms['windows-x86_64'] };
+    await publish(args);
+    const announced = JSON.parse(Buffer.from(written.content, 'base64'));
+    assert.equal(announced.platforms['windows-x86_64'].url, 'https://github.com/Virakhit/Dump/releases/download/v0.1.1-alpha.1/Dump_0.1.1_x64-setup.exe');
+    assert.equal(announced.platforms['windows-x86_64-nsis'].url, announced.platforms['windows-x86_64'].url);
     oldVersion = '0.1.0'; await publish(args); assert.equal(written.sha, 'old-sha');
     for (const version of ['0.1.1', '0.2.0', '1.0.0']) {
       oldVersion = version; written = undefined; await publish(args); assert.equal(written, undefined);
