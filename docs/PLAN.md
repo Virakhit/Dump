@@ -11,7 +11,7 @@ Original requirements: `requirement.md`. Decisions from the planning conversatio
 - Tauri 2, React/TypeScript/Vite/CSS, Rust/Tokio/libp2p, authenticated QUIC and mDNS. Reuse transports, signatures, Windows DPAPI and filesystem primitives rather than custom encryption/authentication infrastructure.
 - One process and versioned protected local state; no backend, database, generic shell commands, or global public discovery.
 - Pin `libp2p-stream` alpha with a lockfile; prove streaming/identity compatibility in executable integration tests before relying on it.
-- Source is MIT licensed; do not publish a release until the physical-machine, installation and pilot gates pass.
+- Source is MIT licensed. Distribute the installer as an explicitly labelled alpha prerelease for testing; a validated beta/stable release still requires the physical-machine, installation and pilot gates.
 - SHA-256 and owner-signed manifests; streamed `.part` downloads and verified no-overwrite completion.
 - Membership snapshots use a pinned owner key and monotonic revisions. No owner transfer or key recovery workflow in v0.1.
 - At most one workspace active. Share refreshes are bound to the original workspace/version and cannot cross groups.

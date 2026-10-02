@@ -7,17 +7,18 @@ Files stay on the owner's device until another member receives them. No account,
 
 ## Install on Windows
 
-Check the project's [GitHub Releases](https://github.com/Virakhit/Dump/releases) for published installers. Installer binaries are distributed as release assets and are not tracked in Git. If no installer is listed, follow the build instructions below.
+**[Download the Windows installer](https://github.com/Virakhit/Dump/releases/download/v0.1.0-alpha.1/Dump_0.1.0_x64-setup.exe)** — approximately 209 MiB.
 
-The existing local alpha build is available at `releases/Dump_0.1.0_x64-setup.exe` (approximately 209 MiB), with its [SHA-256 checksum](releases/Dump_0.1.0_x64-setup.exe.sha256). A fresh source checkout does not include that executable.
+[Release notes and checksum](https://github.com/Virakhit/Dump/releases/tag/v0.1.0-alpha.1). Download the `.exe` installer from the release assets; the source-code ZIP is for developers.
 
-1. Run `Dump_0.1.0_x64-setup.exe` on each Windows device.
-2. Follow the installer prompts. Dump installs for the current Windows user.
-3. Open Dump from the installed application shortcut.
+1. Download and run `Dump_0.1.0_x64-setup.exe` on each Windows device.
+2. Click **Next**, choose an installation folder, and click **Install**. Dump installs for the current Windows user.
+3. On the final wizard screen, leave **Run Dump** selected and click **Finish**.
+4. Later, open **Dump** from the Windows Start Menu or the desktop shortcut if you chose to create one.
 
-The installer bundles the WebView2 offline installer. Node.js, Rust, and build tools are only required when developing or building Dump from source.
+**No terminal commands are needed to use the installed app.** The installer includes the compiled application, its interface, and the WebView2 offline installer. End users do not need Node.js, npm, Rust, or a development server.
 
-The current alpha installer is unsigned. Installation and uninstallation on a clean Windows machine remain unverified. To uninstall, use Windows **Settings > Apps > Installed apps > Dump**.
+The current alpha installer is unsigned. Silent installation and launch from the installed folder have passed on the development Windows machine; a clean Windows machine and interactive wizard navigation still require verification. To uninstall, use Windows **Settings > Apps > Installed apps > Dump**.
 
 ## Share your first file
 
@@ -60,51 +61,9 @@ Sharing does not duplicate the original file. Files being hashed or served are t
 
 Check the network's approved firewall configuration if discovery or connections fail. Internet connections between different networks are outside v0.1's scope.
 
-## Develop from source
+## For developers
 
-### Prerequisites
-
-- Windows 11 x64.
-- Node.js 24 and npm.
-- Rust with the MSVC toolchain, plus Cargo, Rustfmt, and Clippy.
-- Microsoft C++ Build Tools with the **Desktop development with C++** workload.
-- Microsoft Edge WebView2 Runtime.
-
-Run these commands from the project directory:
-
-```powershell
-npm ci
-npm run tauri dev
-```
-
-For an interface-only browser preview, run `npm run dev`. Workspace actions and file transfers require the desktop app.
-
-### Build the installer
-
-```powershell
-npm run tauri build
-```
-
-The Windows x64 NSIS installer is generated in `src-tauri/target/release/bundle/nsis/`. The build includes the WebView2 offline installer; its first download requires an Internet connection. Copy the generated installer into the ignored local `releases/` directory when preparing a distributable build, and generate a matching SHA-256 checksum. Upload the installer and checksum as GitHub Release assets when the release gates pass; do not commit installer executables. The checksum file in this checkout applies to the existing local alpha installer, not to later rebuilds.
-
-### Run checks
-
-```powershell
-npm run build
-npm run test:core
-cargo check --manifest-path src-tauri/Cargo.toml
-cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
-```
-
-The Windows core tests run real authenticated QUIC connections on loopback. They do not establish multi-machine discovery, firewall behavior, installer behavior on a clean machine, or user validation. See [SECURITY.md](SECURITY.md) and [docs/PLAN.md](docs/PLAN.md) for the remaining release gates.
-
-The optional large-file check writes and transfers 8 GiB and requires at least 18 GiB of free temporary disk space:
-
-```powershell
-cargo test --release --manifest-path src-tauri/Cargo.toml --no-default-features --test lan eight_gib_streaming_transfer -- --ignored --nocapture
-```
-
-Current local evidence is recorded in [docs/VERIFICATION.md](docs/VERIFICATION.md). This is an alpha build; review those limits before distributing it.
+Building from source is optional. See the [development guide](docs/DEVELOPMENT.md) for prerequisites, development commands, installer builds, and tests.
 
 ## Documentation
 

@@ -14,6 +14,7 @@ This records checks on the development Windows machine, not approval for a publi
 - High/critical secret scans of authored frontend, Rust core, and Rust tests: zero findings. Generated artifacts and dependency integrity hashes are outside this source scan.
 - Peer static reviews of security and delivery changes; identified findings were corrected and the affected integration checks rerun.
 - Bundled Windows app launched; its native accessibility tree displayed the real desktop interface, generated device identity, and running LAN listener. Browser preview layout inspected. Native screenshot capture/input geometry was unavailable through the automation bridge, so native file-picker, drag/drop, modal and DPI interactions remain unverified.
+- NSIS silent installation on the development Windows machine returned exit code 0. The installed executable, Start Menu shortcut, uninstaller registration, and `dump://` protocol command were present. The installed application launched from `%LOCALAPPDATA%/Dump/dump.exe` and displayed its bundled interface and running LAN listener while no development server was listening on ports 1420 or 4173. Its import table contains Windows system DLLs; no Node.js or Rust installation is required by the packaged executable.
 
 ## Artifact
 
@@ -23,4 +24,4 @@ Final installer: 219,279,799 bytes. SHA-256: `c35eb85ecf6df7e892cc95f83f6cf0d8a6
 
 ## Still required
 
-Physical two/three-machine Windows LAN checks, discovery/firewall scenarios, removal/reconnect during an active transfer, target-machine memory observations, native keyboard/DPI/drop checks, clean installation/uninstallation and deep links, packet capture, and the five-user pilot are listed in `PLAN.md`. CI is authored but has not run remotely. No users have been contacted, production deployed, or repository published.
+Physical two/three-machine Windows LAN checks, discovery/firewall scenarios, removal/reconnect during an active transfer, target-machine memory observations, native keyboard/DPI/drop checks, interactive wizard navigation, clean installation/uninstallation and deep-link launch, packet capture, and the five-user pilot are listed in `PLAN.md`. The source repository has been pushed to GitHub. The first remote Windows CI run found a test sequencing race: it requested a stream before the asynchronous dial was registered. The test now waits for authenticated catalog admission before continuing; remote rerun status is reported separately. No prospective users have been contacted, and the installer remains an alpha preview rather than a validated beta.

@@ -64,7 +64,10 @@ async fn authenticated_quic_file_loop_and_revocation() -> Result<()> {
     let old = b.lock().await.active_snapshot()?;
     join(&na, &nc).await?;
     let b_id: PeerId = b.lock().await.peer().parse()?;
+    let c_id = c.lock().await.peer();
     nc.connect(b_id, address(&nb).await?).await?;
+    // connect queues a dial; wait for authenticated admission before requesting a stream.
+    wait(&b, |v| v.online.contains(&c_id)).await?;
     // The newcomer's signed snapshot authorizes it on a peer that only knows an older roster.
     nc.refresh_peer(b_id).await?;
     assert_eq!(
@@ -148,7 +151,6 @@ async fn authenticated_quic_file_loop_and_revocation() -> Result<()> {
     .await?;
     assert!(!changed_dir.join(&manifest.name).exists());
     // Isolated peers keep old membership until an authentic new revision arrives.
-    let c_id = c.lock().await.peer();
     a.lock().await.remove_member(&c_id)?;
     let removed = a.lock().await.active_snapshot()?;
     assert!(b.lock().await.active_snapshot()?.contains(&c_id));
