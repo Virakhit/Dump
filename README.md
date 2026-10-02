@@ -71,7 +71,7 @@ Check the network's approved firewall configuration if discovery or connections 
 
 Building from source is optional. See the [development guide](docs/DEVELOPMENT.md) for prerequisites, development commands, installer builds, and tests.
 
-The v0.2 Internet milestone is under development. Stages 1–3 add Identify, bounded explicit dialing, AutoNAT v2, authenticated TCP fallback and an explicitly configured encrypted circuit relay client to the Rust core. Confirmed public address evidence expires; all routes still require workspace authorization. New streams prefer an established direct route while existing circuit transfers can finish. LAN invitations and mDNS remain available without Internet access. This is not yet an end-user cross-network release: automatic Internet invites, hole punching and relay participation/settings UI are pending in the [staged plan](docs/PLAN.md). The installer linked above remains the published LAN-only 0.1.1 build.
+The v0.2 Internet milestone is under development. Stages 1–5 add Identify, bounded explicit dialing, AutoNAT v2, authenticated TCP fallback and an explicitly configured encrypted circuit relay client to the Rust core. Confirmed public address evidence expires; all routes still require workspace authorization. New streams prefer an established direct route while existing circuit transfers can finish. LAN invitations and mDNS remain available without Internet access. This is not yet an end-user cross-network release: DCUtR and opt-in relay hosting/settings are locally tested; automatic Internet invites are pending in the [staged plan](docs/PLAN.md). The installer linked above remains the published LAN-only 0.1.1 build.
 
 ## Documentation
 

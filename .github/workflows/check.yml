@@ -19,6 +19,7 @@ jobs:
       - run: npm run build
       - run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
       - run: cargo test --manifest-path src-tauri/Cargo.toml --no-default-features --locked
+      - run: cargo test --manifest-path src-tauri/Cargo.toml --locked -p libp2p-stream --lib
       - run: cargo test --manifest-path src-tauri/Cargo.toml --features updater-tests --test updater --locked
       - run: cargo test --manifest-path src-tauri/Cargo.toml --lib --locked
       - run: node --test scripts/publish-update.test.cjs

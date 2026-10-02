@@ -139,6 +139,21 @@ async fn get_state(state: tauri::State<'_, Desktop>) -> Result<View, String> {
     Ok(state.shared.lock().await.view())
 }
 #[tauri::command]
+async fn save_network(
+    state: tauri::State<'_, Desktop>,
+    settings: crate::relay_host::Settings,
+) -> Result<(), String> {
+    let mut e = state.shared.lock().await;
+    settings
+        .validate(e.key.public().to_peer_id())
+        .map_err(|err| err.to_string())?;
+    let mut next = e.persisted.clone();
+    next.network = settings;
+    e.persist(next).map_err(|err| err.to_string())?;
+    e.emit();
+    Ok(())
+}
+#[tauri::command]
 async fn dispatch(state: tauri::State<'_, Desktop>, action: Action) -> Result<(), String> {
     engine::dispatch(&mut *state.shared.lock().await, action).map_err(|e| e.to_string())
 }
@@ -263,6 +278,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             get_state,
+            save_network,
             dispatch,
             choose_share_files,
             share_dropped_files,

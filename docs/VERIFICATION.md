@@ -37,6 +37,13 @@ This records checks on the development Windows machine, not approval for a publi
 - A production-filtered circuit test confirmed failed hole punching still carried a complete verified file and retained the relay fallback. Private/DNS/mismatched identity hole-punch routes are rejected before dialing. Negotiations are bounded to eight handler events per connection and 1024 per connected lifetime; the native behavior resets after all connections close.
 - These tests use no public service and do not prove traversal of a real NAT or firewall. No new installer was published.
 
+## v0.2 Stage 5 — opt-in forwarding
+
+- Core suite: 21 passed; desktop library: 12 passed; frontend build, Rustfmt and configured Clippy passed. The separate patched stream package regression test also passed (4096 connection cycles).
+- Two concurrent streams shared the 2 MiB/s application-byte bucket, and the 61st incoming connection attempt in one rolling minute was denied. A real local host swarm denied an excess reservation, then cut off an authorized 1 MiB file when its test circuit exceeded the configured 128 KiB budget. The destination directory and persisted partial list remained empty. Production limits are documented in PROTOCOL.md.
+- The first host build exposed the derive macro's visibility requirement; the admission type now has matching crate visibility. The first quota test appended a duplicate destination suffix to an already complete reservation address; removing that test error fixed it. Complete checks passed after correction.
+- Advanced settings persist under DPAPI with opt-in disabled by default and changes applied after restart. The host has no Engine or file/disk API. Public hosting, wizard interaction, rate fairness under attack and real NAT/firewall behavior remain unverified; no new installer was published. The hosting role currently forwards circuits, not AutoNAT probes.
+
 ## Passed
 
 - TypeScript and Vite production build.

@@ -67,6 +67,7 @@ pub struct View {
     pub transfers: Vec<Transfer>,
     pub invite_url: Option<String>,
     pub last_error: Option<String>,
+    pub network: crate::relay_host::Settings,
 }
 
 pub struct Engine {
@@ -213,6 +214,7 @@ impl Engine {
             transfers: self.transfers.values().cloned().collect(),
             invite_url: self.invite_url.clone(),
             last_error: self.last_error.clone(),
+            network: self.persisted.network.clone(),
         }
     }
     pub fn create_workspace(&mut self, name: String) -> Result<()> {

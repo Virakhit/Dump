@@ -273,6 +273,14 @@ impl Node {
         let (relay_tx, relay_addresses) = watch::channel(Vec::new());
         let limits = Arc::new(Limits::new());
         let shutdown = CancellationToken::new();
+        {
+            let mut e = shared.lock().await;
+            if let Err(err) =
+                crate::relay_host::start(e.key.clone(), &e.persisted.network, shutdown.clone())
+            {
+                e.error(format!("Network assistance could not start: {err}"));
+            }
+        }
         let node = Self {
             shared: shared.clone(),
             control: control.clone(),

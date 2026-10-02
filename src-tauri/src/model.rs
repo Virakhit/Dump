@@ -247,6 +247,8 @@ pub struct Persisted {
     pub joining: Option<Invitation>,
     pub partials: Vec<PathBuf>,
     pub history: Vec<AuditEvent>,
+    #[serde(default)]
+    pub network: crate::relay_host::Settings,
 }
 impl Persisted {
     pub fn new() -> Result<Self> {
@@ -261,6 +263,7 @@ impl Persisted {
             joining: None,
             partials: Vec::new(),
             history: Vec::new(),
+            network: Default::default(),
         })
     }
     pub fn key(&self) -> Result<Keypair> {

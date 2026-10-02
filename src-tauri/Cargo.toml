@@ -47,3 +47,6 @@ windows-sys = { version = "0.61", features = ["Win32_Security_Cryptography", "Wi
 
 [dev-dependencies]
 tempfile = "3"
+
+[patch.crates-io]
+libp2p-stream = { path = "vendor/libp2p-stream" }
