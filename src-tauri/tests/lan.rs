@@ -24,7 +24,11 @@ async fn address(node: &Node) -> Result<libp2p::Multiaddr> {
     let mut addresses = node.addresses.clone();
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            if let Some(addr) = addresses.borrow().first() {
+            if let Some(addr) = addresses
+                .borrow()
+                .iter()
+                .find(|a| a.iter().any(|p| p == libp2p::multiaddr::Protocol::QuicV1))
+            {
                 return Ok(addr.clone());
             }
             addresses.changed().await?;

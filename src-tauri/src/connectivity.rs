@@ -26,6 +26,7 @@ pub enum ConnectionState {
     Offline,
     Connecting,
     Direct,
+    Relay,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,7 +57,7 @@ pub(crate) fn diagnostic(
     Some(diagnostics.entry(peer).or_default())
 }
 
-/// Stage 1 accepts literal-IP QUIC only. Explicit callers may use LAN/loopback IPs.
+/// Literal-IP QUIC or authenticated TCP. Explicit callers may use LAN/loopback IPs.
 /// Require a matching terminal Peer ID, or attach it at dial time for authentication.
 pub fn direct_address(peer: PeerId, mut address: Multiaddr) -> Result<Multiaddr> {
     ensure!(address.to_vec().len() <= 256, "Address is too long");
@@ -70,14 +71,42 @@ pub fn direct_address(peer: PeerId, mut address: Multiaddr) -> Result<Multiaddr>
         Some(Protocol::Ip6(ip)) => !ip.is_unspecified() && !ip.is_multicast(),
         _ => false,
     };
+    let transport = match parts.next() {
+        Some(Protocol::Udp(port)) if port != 0 => matches!(parts.next(), Some(Protocol::QuicV1)),
+        Some(Protocol::Tcp(port)) => port != 0,
+        _ => false,
+    };
     ensure!(
-        valid_ip
-            && matches!(parts.next(), Some(Protocol::Udp(port)) if port != 0)
-            && matches!(parts.next(), Some(Protocol::QuicV1))
-            && parts.next().is_none(),
-        "Use a literal IP address with a nonzero QUIC UDP port"
+        valid_ip && transport && parts.next().is_none(),
+        "Use a literal IP address with a nonzero QUIC UDP or TCP port"
     );
     Ok(address)
+}
+
+pub fn peer_address(peer: PeerId, mut address: Multiaddr) -> Result<Multiaddr> {
+    ensure!(address.to_vec().len() <= 512, "Address is too long");
+    if !is_relayed(&address) {
+        return direct_address(peer, address);
+    }
+    if let Some(Protocol::P2p(id)) = address.iter().last() {
+        ensure!(id == peer, "Address belongs to another peer");
+        address.pop();
+    }
+    ensure!(
+        matches!(address.pop(), Some(Protocol::P2pCircuit)),
+        "Invalid circuit address"
+    );
+    let Some(Protocol::P2p(relay)) = address.pop() else {
+        anyhow::bail!("Circuit needs a relay identity");
+    };
+    ensure!(relay != peer, "Relay cannot impersonate the destination");
+    Ok(direct_address(relay, address)?
+        .with(Protocol::P2p(relay))
+        .with(Protocol::P2pCircuit))
+}
+
+pub fn is_relayed(address: &Multiaddr) -> bool {
+    address.iter().any(|p| p == Protocol::P2pCircuit)
 }
 
 /// Conservative candidate filter, not proof of Internet reachability.
@@ -120,7 +149,7 @@ impl AddressBook {
     }
 
     pub fn remember(&mut self, peer: PeerId, address: Multiaddr) -> Result<bool> {
-        let address = direct_address(peer, address)?;
+        let address = peer_address(peer, address)?;
         ensure!(
             self.0.len() < MAX_PEERS || self.0.contains_key(&peer),
             "Peer address limit reached"
@@ -163,7 +192,7 @@ mod tests {
             "/ip4/224.0.0.1/udp/9000/quic-v1",
             "/ip4/255.255.255.255/udp/9000/quic-v1",
             "/ip4/127.0.0.1/udp/0/quic-v1",
-            "/ip4/127.0.0.1/tcp/9000",
+            "/ip4/127.0.0.1/tcp/0",
             "/dns4/example.com/udp/9000/quic-v1",
             "/ip4/127.0.0.1/udp/9000/quic-v1/p2p-circuit",
         ] {
@@ -231,6 +260,28 @@ mod tests {
         assert!(public_address(
             &"/ip6/2606:4700::1/udp/9000/quic-v1".parse()?
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn circuit_addresses_bind_both_relay_and_destination() -> Result<()> {
+        let owner = peer();
+        let relay = peer();
+        let direct: Multiaddr = "/ip4/127.0.0.1/tcp/9000".parse()?;
+        let route = direct
+            .clone()
+            .with(Protocol::P2p(relay))
+            .with(Protocol::P2pCircuit);
+        assert_eq!(peer_address(owner, route.clone())?, route);
+        assert_eq!(
+            peer_address(owner, route.clone().with(Protocol::P2p(owner)))?,
+            route
+        );
+        assert!(peer_address(owner, route.clone().with(Protocol::P2p(peer()))).is_err());
+        assert!(peer_address(relay, route.clone()).is_err());
+        assert!(peer_address(owner, direct.clone().with(Protocol::P2pCircuit)).is_err());
+        assert!(peer_address(owner, route.with(Protocol::P2pCircuit)).is_err());
+        assert_eq!(direct_address(owner, direct.clone())?, direct);
         Ok(())
     }
 }

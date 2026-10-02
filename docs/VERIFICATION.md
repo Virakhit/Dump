@@ -19,6 +19,17 @@ This records checks on the development Windows machine, not approval for a publi
 - The first dial-back harness timed out because it omitted Identify, which AutoNAT uses to learn server protocol support. The initial broader run failed for the same reason. Adding Identify to both test swarms fixed the harness; the focused test and complete suites then passed. The shipped node already included Identify.
 - No public probe/relay/bootstrap service was contacted. AutoNAT server assistance, circuit relay transport, DCUtR, invitation contacts and real cross-network acceptance remain pending. The current bounded client does not re-probe completed candidates until all connections close; expired confirmations are withdrawn. Long-lived-session reconfirmation remains an integration item in the delivery plan.
 
+## v0.2 Stage 3 — encrypted circuit relay client
+
+- Core Rust suite: 17 passed (seven unit, four connectivity integration, four existing LAN integration, two relay integration); 8 GiB remained ignored. Desktop library suite: eight passed. Frontend production build, Rustfmt, diff whitespace check and configured Clippy passed.
+- A local circuit relay v2 carried the existing invite/owner approval, authenticated catalog and a 2 MiB + 17 byte file transfer between two Dump nodes. The received bytes matched exactly and no partial remained. These circuit connections negotiate end-peer Noise plus Yamux through the configured libp2p transport.
+- An authenticated outsider using the circuit received denial for catalog and file requests, and the relay's real identity failed workspace catalog authorization. A private loopback circuit address was not advertised by the owner's Identify response. No global workspace discovery was added.
+- The same peer established a direct QUIC route alongside its circuit. After stopping the relay, an authorized catalog request still succeeded using direct; no forced circuit closure is used for route selection. This is explicit direct takeover, not a DCUtR test.
+- Stopping the relay after a 64 MiB receive had written some partial bytes caused a failed/cancelled transfer, no destination file, no `.part`, and no recorded partial remaining.
+- A separate direct TCP/Noise/Yamux route passed invite approval and authorized catalog exchange. Address parser tests reject mismatched destination identities, missing relay identity, relay/destination substitution and nested circuits. Existing direct identity, LAN mDNS, owner-offline, signed roster, source-change, pagination and cancellation checks passed.
+- Initial relay tests timed out because the test server had no external address to advertise in reservations; adding an explicit test-only loopback advertisement fixed that harness. The next direct-takeover test exposed the default libp2p dial condition, which prevents adding a direct connection while already connected via relay; the explicit upgrade uses `PeerCondition::Always`. Clippy then rejected one collapsible match, which was corrected. Complete checks passed after these fixes.
+- No public relay, actual NAT/hole punch or new installer was used. Relay host opt-in/resource ceilings, automatic Internet contact handling and a dedicated hostile-provider byte-corruption transfer test remain later-stage work. This stage does not change persisted identities, workspace data or v1 signed payloads.
+
 ## Passed
 
 - TypeScript and Vite production build.

@@ -13,7 +13,11 @@ async fn address(node: &Node) -> Result<Multiaddr> {
     let mut addresses = node.addresses.clone();
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
-            if let Some(address) = addresses.borrow().first() {
+            if let Some(address) = addresses
+                .borrow()
+                .iter()
+                .find(|a| a.iter().any(|p| p == libp2p::multiaddr::Protocol::QuicV1))
+            {
                 return Ok(address.clone());
             }
             addresses.changed().await?;
@@ -197,6 +201,68 @@ async fn lan_mdns_still_finds_invited_owner_without_explicit_addresses() -> Resu
         member.lock().await.active_snapshot()?.contains(&member_id),
         "LAN approval missing"
     );
+    a.shutdown.cancel();
+    b.shutdown.cancel();
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn authenticated_tcp_route_supports_the_same_workspace_protocol() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let owner = Engine::open(&root.path().join("owner"), Arc::new(|_| {}))?;
+    let member = Engine::open(&root.path().join("member"), Arc::new(|_| {}))?;
+    owner.lock().await.create_workspace("TCP fallback".into())?;
+    member
+        .lock()
+        .await
+        .join(&owner.lock().await.create_invite()?)?;
+    let a = Node::start(owner.clone(), false).await?;
+    let b = Node::start(member.clone(), false).await?;
+    let owner_id: PeerId = owner.lock().await.peer().parse()?;
+    let mut addresses = a.addresses.clone();
+    let tcp = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(address) = addresses.borrow().iter().find(|a| {
+                a.iter()
+                    .any(|p| matches!(p, libp2p::multiaddr::Protocol::Tcp(_)))
+            }) {
+                return Ok::<_, anyhow::Error>(address.clone());
+            }
+            addresses.changed().await?;
+        }
+    })
+    .await??;
+    b.connect(owner_id, tcp).await?;
+    diagnostic(&b, owner_id, |d| {
+        d.state == ConnectionState::Direct && d.identified
+    })
+    .await?;
+    let member_id = member.lock().await.peer();
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if owner.lock().await.pending.contains_key(&member_id) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await?;
+    owner.lock().await.approve(&member_id)?;
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if member.lock().await.persisted.active.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await?;
+    b.refresh_peer(owner_id).await?;
+    assert!(member
+        .lock()
+        .await
+        .online
+        .contains_key(&owner_id.to_string()));
     a.shutdown.cancel();
     b.shutdown.cancel();
     Ok(())

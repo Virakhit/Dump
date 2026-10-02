@@ -1,22 +1,26 @@
 use crate::{
     connectivity::{
-        diagnostic, direct_address, public_address, AddressBook, ConnectionState, Diagnostics,
-        DialFailure, Reachability, ReachabilityStatus, MAX_ADDRESSES,
+        diagnostic, direct_address, is_relayed, peer_address, public_address, AddressBook,
+        ConnectionState, Diagnostics, DialFailure, Reachability, ReachabilityStatus, MAX_ADDRESSES,
     },
     engine::{open_source, refresh_share, stamp, Shared},
+    identify::Identify,
     model::*,
     reachability::{Client as NatClient, PublicAddresses},
     storage::commit_download,
+    streams::Streams,
 };
 use anyhow::{bail, ensure, Context, Result};
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, StreamExt};
 use libp2p::{
-    connection_limits, identify, mdns, ping,
+    connection_limits, identify, mdns, noise, ping, relay,
     swarm::{
-        behaviour::toggle::Toggle, dial_opts::DialOpts, DialError, FromSwarm, NetworkBehaviour,
-        NewExternalAddrCandidate, Stream, StreamProtocol, SwarmEvent,
+        behaviour::toggle::Toggle,
+        dial_opts::{DialOpts, PeerCondition},
+        ConnectionId, DialError, FromSwarm, NetworkBehaviour, NewExternalAddrCandidate, Stream,
+        StreamProtocol, SwarmEvent,
     },
-    Multiaddr, PeerId, SwarmBuilder,
+    tcp, yamux, Multiaddr, PeerId, SwarmBuilder,
 };
 use libp2p_stream::Control;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -41,10 +45,12 @@ const INACTIVITY: Duration = Duration::from_secs(30);
 
 #[derive(NetworkBehaviour)]
 struct Behaviour {
-    streams: libp2p_stream::Behaviour,
+    streams: Streams,
+    relay_streams: Streams,
+    relay: relay::client::Behaviour,
     mdns: Toggle<mdns::tokio::Behaviour>,
     ping: ping::Behaviour,
-    identify: identify::Behaviour,
+    identify: Identify,
     autonat: NatClient,
     limits: connection_limits::Behaviour,
 }
@@ -151,16 +157,38 @@ struct Dial {
     peer: PeerId,
     address: Multiaddr,
     reply: oneshot::Sender<Result<()>>,
+    reserve: bool,
+}
+
+fn connection_state(
+    connections: &BTreeMap<ConnectionId, (PeerId, bool)>,
+    peer: PeerId,
+) -> ConnectionState {
+    if connections
+        .values()
+        .any(|(id, relayed)| *id == peer && !relayed)
+    {
+        ConnectionState::Direct
+    } else if connections
+        .values()
+        .any(|(id, relayed)| *id == peer && *relayed)
+    {
+        ConnectionState::Relay
+    } else {
+        ConnectionState::Offline
+    }
 }
 
 #[derive(Clone)]
 pub struct Node {
     pub shared: Shared,
     pub control: Control,
+    relay_control: Control,
     dial: mpsc::Sender<Dial>,
     pub addresses: watch::Receiver<Vec<Multiaddr>>,
     pub diagnostics: watch::Receiver<Diagnostics>,
     pub reachability: watch::Receiver<Reachability>,
+    pub relay_addresses: watch::Receiver<Vec<Multiaddr>>,
     limits: Arc<Limits>,
     pub shutdown: CancellationToken,
 }
@@ -175,16 +203,24 @@ impl Node {
         };
         let mut swarm = SwarmBuilder::with_existing_identity(key)
             .with_tokio()
+            .with_tcp(
+                tcp::Config::default().nodelay(true),
+                noise::Config::new,
+                yamux::Config::default,
+            )?
             .with_quic()
-            .with_behaviour(|key| Behaviour {
-                streams: libp2p_stream::Behaviour::new(),
+            .with_relay_client(noise::Config::new, yamux::Config::default)?
+            .with_behaviour(|key, relay| Behaviour {
+                streams: Streams::new(false),
+                relay_streams: Streams::new(true),
+                relay,
                 mdns: mdns.into(),
                 ping: ping::Behaviour::new(
                     ping::Config::new()
                         .with_interval(Duration::from_secs(5))
                         .with_timeout(Duration::from_secs(5)),
                 ),
-                identify: identify::Behaviour::new(
+                identify: Identify::new(
                     identify::Config::new("/dump/1".into(), key.public())
                         .with_agent_version(format!("dump/{}", env!("CARGO_PKG_VERSION")))
                         // Never leak interface addresses to Internet peers or cache their
@@ -213,22 +249,35 @@ impl Node {
             }
             .parse()?,
         )?;
-        let mut control = swarm.behaviour().streams.new_control();
-        let mut incoming = control.accept(CONTROL)?;
-        let mut files = control.accept(FILE)?;
+        swarm.listen_on(
+            if discovery {
+                "/ip4/0.0.0.0/tcp/0"
+            } else {
+                "/ip4/127.0.0.1/tcp/0"
+            }
+            .parse()?,
+        )?;
+        let mut control = swarm.behaviour().streams.control();
+        let mut relay_control = swarm.behaviour().relay_streams.control();
+        let mut incoming =
+            futures::stream::select(control.accept(CONTROL)?, relay_control.accept(CONTROL)?);
+        let mut files = futures::stream::select(control.accept(FILE)?, relay_control.accept(FILE)?);
         let (dial, mut dials) = mpsc::channel(128);
         let (address_tx, addresses) = watch::channel(Vec::new());
         let (diagnostic_tx, diagnostics) = watch::channel(Diagnostics::new());
         let (reachability_tx, reachability) = watch::channel(Reachability::default());
+        let (relay_tx, relay_addresses) = watch::channel(Vec::new());
         let limits = Arc::new(Limits::new());
         let shutdown = CancellationToken::new();
         let node = Self {
             shared: shared.clone(),
             control: control.clone(),
+            relay_control,
             dial,
             addresses,
             diagnostics,
             reachability,
+            relay_addresses,
             limits: limits.clone(),
             shutdown: shutdown.clone(),
         };
@@ -242,18 +291,27 @@ impl Node {
             let mut tick = tokio::time::interval(Duration::from_secs(2));
             let mut listeners = Vec::new();
             let mut public = PublicAddresses::default();
+            let mut reservations = BTreeMap::new();
+            let mut connections = BTreeMap::new();
             loop {
                 tokio::select! {
                     _ = shutdown.cancelled() => break,
-                    Some(Dial { peer, address, reply }) = dials.recv() => {
+                    Some(Dial { peer, address, reply, reserve }) = dials.recv() => {
                         let result = (|| {
                             discovered.remember(peer, address.clone())?;
                             swarm.add_peer_address(peer, address.clone());
-                            if !swarm.is_connected(&peer) {
-                                swarm.dial(DialOpts::peer_id(peer).addresses(vec![address]).build())?;
+                            if reserve {
+                                if !reservations.contains_key(&peer) {
+                                    ensure!(reservations.len() < 3, "Relay reservation limit reached");
+                                    let id = swarm.listen_on(address.with(libp2p::multiaddr::Protocol::P2p(peer)).with(libp2p::multiaddr::Protocol::P2pCircuit))?;
+                                    reservations.insert(peer, id);
+                                }
+                            } else if connection_state(&connections, peer) == ConnectionState::Offline || (!is_relayed(&address) && connection_state(&connections, peer) == ConnectionState::Relay) {
+                                let condition = if connection_state(&connections, peer) == ConnectionState::Relay { PeerCondition::Always } else { PeerCondition::DisconnectedAndNotDialing };
+                                swarm.dial(DialOpts::peer_id(peer).condition(condition).addresses(vec![address.with(libp2p::multiaddr::Protocol::P2p(peer))]).build())?;
                                 diagnostic_tx.send_modify(|d| {
                                     if let Some(d) = diagnostic(d, peer) {
-                                        d.state = ConnectionState::Connecting;
+                                        if !swarm.is_connected(&peer) { d.state = ConnectionState::Connecting; }
                                         d.last_failure = None;
                                     }
                                 });
@@ -276,7 +334,9 @@ impl Node {
                     },
                     event = swarm.select_next_some() => match event {
                         SwarmEvent::NewListenAddr { address, .. } => {
-                            if public_address(&address) {
+                            if is_relayed(&address) {
+                                relay_tx.send_modify(|a| { if a.len() < 3 && !a.contains(&address) { a.push(address.clone()); } });
+                            } else if public_address(&address) {
                                 swarm.behaviour_mut().autonat.on_swarm_event(FromSwarm::NewExternalAddrCandidate(NewExternalAddrCandidate { addr: &address }));
                             }
                             listeners.push(address); let _ = address_tx.send(listeners.clone());
@@ -284,6 +344,12 @@ impl Node {
                         },
                         SwarmEvent::ExpiredListenAddr { address, .. } => {
                             listeners.retain(|a| a != &address); let _ = address_tx.send(listeners.clone());
+                            relay_tx.send_modify(|a| a.retain(|a| a != &address));
+                        },
+                        SwarmEvent::ListenerClosed { listener_id, addresses, .. } => {
+                            reservations.retain(|_, id| *id != listener_id);
+                            listeners.retain(|a| !addresses.contains(a)); let _ = address_tx.send(listeners.clone());
+                            relay_tx.send_modify(|a| a.retain(|a| !addresses.contains(a)));
                         },
                         SwarmEvent::Behaviour(BehaviourEvent::Mdns(mdns::Event::Discovered(peers))) => for (peer, address) in peers {
                             if discovered.remember(peer, address.clone()).is_ok_and(|added| added) {
@@ -326,10 +392,11 @@ impl Node {
                                 });
                             }
                         },
-                        SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                        SwarmEvent::ConnectionEstablished { peer_id, connection_id, endpoint, .. } => {
+                            connections.insert(connection_id, (peer_id, endpoint.is_relayed()));
                             diagnostic_tx.send_modify(|d| {
                                 if let Some(d) = diagnostic(d, peer_id) {
-                                    d.state = ConnectionState::Direct;
+                                    d.state = connection_state(&connections, peer_id);
                                     d.last_failure = None;
                                 }
                             });
@@ -342,7 +409,12 @@ impl Node {
                                 }
                             });
                         },
-                        SwarmEvent::ConnectionClosed { peer_id, num_established: 0, .. } => {
+                        SwarmEvent::ConnectionClosed { peer_id, connection_id, num_established, .. } => {
+                            connections.remove(&connection_id);
+                            if num_established != 0 {
+                                diagnostic_tx.send_modify(|d| { if let Some(d) = diagnostic(d, peer_id) { d.state = connection_state(&connections, peer_id); } });
+                                continue;
+                            }
                             let expired = public.expire(Some(peer_id), Instant::now());
                             for address in &expired { swarm.remove_external_address(address); }
                             if !expired.is_empty() {
@@ -361,7 +433,10 @@ impl Node {
                             for (id,t) in &e.transfers { if t.peer_id == peer_id.to_string() { if let Some(c) = e.cancellations.get(id) { c.cancel(); } } }
                             e.emit();
                         },
-                        SwarmEvent::ListenerError { .. } => shared.lock().await.error("LAN listener failed; restart Dump and check Windows firewall"),
+                        SwarmEvent::ListenerError { listener_id, .. } => {
+                            let message = if reservations.values().any(|id| *id == listener_id) { "Configured relay is unavailable or has no capacity; direct and LAN routes can still work" } else { "Local listener failed; restart Dump and check Windows firewall" };
+                            shared.lock().await.error(message);
+                        },
                         _ => {},
                     },
                     _ = tick.tick() => {
@@ -378,7 +453,7 @@ impl Node {
                         e.pending.retain(|_,p| now().saturating_sub(p.requested_at) < 86400);
                         let joining = e.persisted.joining.clone();
                         let targets = e.active_snapshot().ok().filter(|s| s.contains(&e.peer())).map(|s| s.members.into_iter().filter_map(|m| m.peer_id.parse::<PeerId>().ok()).filter(|p| *p != peer).collect::<Vec<_>>()).unwrap_or_default();
-                        e.network_status = if !e.online.is_empty() { "Connected directly" } else if joining.is_some() { "Connecting…" } else if listeners.is_empty() { "Offline" } else if discovery { "LAN discovery is running" } else { "Listening for direct connections" }.into();
+                        e.network_status = if !e.online.is_empty() { if e.online.keys().filter_map(|p| p.parse().ok()).any(|p| connection_state(&connections, p) == ConnectionState::Direct) { "Connected directly" } else { "Connected via relay" } } else if joining.is_some() { "Connecting…" } else if listeners.is_empty() { "Offline" } else if discovery { "LAN discovery is running" } else { "Listening for direct connections" }.into();
                         e.emit(); drop(e);
                         for target in targets.into_iter().filter(|p| discovered.contains(p)) {
                             let mut ongoing = in_flight.lock().await;
@@ -411,6 +486,7 @@ impl Node {
             e.emit();
             diagnostic_tx.send_modify(|d| d.clear());
             reachability_tx.send_replace(Reachability::default());
+            relay_tx.send_replace(Vec::new());
         });
         let refresh_shared = node.shared.clone();
         let refresh_shutdown = node.shutdown.clone();
@@ -446,6 +522,22 @@ impl Node {
         Ok(node)
     }
     pub async fn connect(&self, peer: PeerId, address: Multiaddr) -> Result<()> {
+        let address = peer_address(peer, address)?;
+        let (reply, registered) = oneshot::channel();
+        self.dial
+            .send(Dial {
+                peer,
+                address,
+                reply,
+                reserve: false,
+            })
+            .await?;
+        // Acknowledges registration, not connection success; consult diagnostics for that.
+        tokio::time::timeout(PREAUTH_TIMEOUT, registered).await??
+    }
+
+    /// Configurable relay client API. No relay is contacted unless explicitly supplied.
+    pub async fn reserve_relay(&self, peer: PeerId, address: Multiaddr) -> Result<()> {
         let address = direct_address(peer, address)?;
         let (reply, registered) = oneshot::channel();
         self.dial
@@ -453,13 +545,26 @@ impl Node {
                 peer,
                 address,
                 reply,
+                reserve: true,
             })
             .await?;
-        // Acknowledges registration, not connection success; consult diagnostics for that.
         tokio::time::timeout(PREAUTH_TIMEOUT, registered).await??
     }
+
+    pub fn stream_control(&self, peer: PeerId) -> Control {
+        if self
+            .diagnostics
+            .borrow()
+            .get(&peer)
+            .is_some_and(|d| d.state == ConnectionState::Relay)
+        {
+            self.relay_control.clone()
+        } else {
+            self.control.clone()
+        }
+    }
     pub async fn request(&self, peer: PeerId, request: &Request) -> Result<Response> {
-        let mut control = self.control.clone();
+        let mut control = self.stream_control(peer);
         let mut stream =
             tokio::time::timeout(PREAUTH_TIMEOUT, control.open_stream(peer, CONTROL)).await??;
         write_frame(&mut stream, request).await?;
@@ -702,7 +807,7 @@ impl Node {
             );
             snapshot
         };
-        let mut control = self.control.clone();
+        let mut control = self.stream_control(peer);
         let mut stream = tokio::select! {
             _ = cancel.cancelled() => bail!("Transfer cancelled"),
             stream = tokio::time::timeout(PREAUTH_TIMEOUT, control.open_stream(peer, FILE)) => stream??,

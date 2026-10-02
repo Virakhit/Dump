@@ -197,7 +197,7 @@ mod tests {
         for address in [
             "/ip4/10.0.0.1/udp/1000/quic-v1",
             "/ip4/100.64.0.1/udp/1000/quic-v1",
-            "/ip4/8.8.8.8/tcp/1000",
+            "/ip4/8.8.8.8/tcp/0",
         ] {
             assert!(client.candidate(&address.parse()?).is_none());
         }
