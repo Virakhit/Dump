@@ -1,7 +1,8 @@
 use crate::{
     connectivity::{
         diagnostic, direct_address, is_relayed, peer_address, public_address, AddressBook,
-        ConnectionState, Diagnostics, DialFailure, Reachability, ReachabilityStatus, MAX_ADDRESSES,
+        ConnectionState, Diagnostics, DialFailure, ProtocolOutcome, Reachability,
+        ReachabilityStatus, MAX_ADDRESSES,
     },
     engine::{open_source, refresh_share, stamp, Shared},
     holepunch::HolePunch,
@@ -37,6 +38,7 @@ use tokio::{
     sync::{mpsc, oneshot, watch, Mutex, Semaphore},
 };
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 use uuid::Uuid;
 
 const CONTROL: StreamProtocol = StreamProtocol::new("/dump/control/1");
@@ -44,6 +46,51 @@ const FILE: StreamProtocol = StreamProtocol::new("/dump/file/1");
 const CONTACT: StreamProtocol = StreamProtocol::new("/dump/contact/1");
 const PREAUTH_TIMEOUT: Duration = Duration::from_secs(5);
 const INACTIVITY: Duration = Duration::from_secs(30);
+const RELAY_INTERRUPTED: &str = "Relay connection closed or stalled. Its transfer limit may have been reached. Try again manually using a direct connection or ask the relay operator about limits.";
+
+fn relay_error(error: anyhow::Error, relayed: bool) -> anyhow::Error {
+    if relayed
+        && error
+            .chain()
+            .any(|cause| cause.is::<std::io::Error>() || cause.is::<tokio::time::error::Elapsed>())
+    {
+        error.context(RELAY_INTERRUPTED)
+    } else {
+        error
+    }
+}
+
+async fn remove_owned_partial(part: &Path, created: bool) -> bool {
+    if !created {
+        return true;
+    }
+    match tokio::fs::remove_file(part).await {
+        Ok(()) => true,
+        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+    }
+}
+
+async fn create_owned_partial(
+    shared: &Shared,
+    part: &Path,
+    id: Uuid,
+    created: &mut bool,
+) -> Result<tokio::fs::File> {
+    let file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(part)
+        .await
+        .context("Cannot create temporary download")?;
+    *created = true;
+    // Record only a path we exclusively created, never a colliding user's file.
+    let mut e = shared.lock().await;
+    let mut next = e.persisted.clone();
+    next.partials.push(part.to_path_buf());
+    e.persist(next)?;
+    e.mark_transfer(id, "Receiving", 0, None);
+    Ok(file)
+}
 
 #[derive(NetworkBehaviour)]
 struct Behaviour {
@@ -147,6 +194,14 @@ struct Limits {
     send: Arc<Semaphore>,
     receive: Arc<Semaphore>,
     peers: Mutex<BTreeMap<PeerId, PeerSlots>>,
+    #[cfg(test)]
+    receive_pause: Mutex<Option<ReceivePause>>,
+}
+
+#[cfg(test)]
+struct ReceivePause {
+    started: oneshot::Sender<()>,
+    resume: oneshot::Receiver<()>,
 }
 impl Limits {
     fn new() -> Self {
@@ -154,6 +209,8 @@ impl Limits {
             send: Arc::new(Semaphore::new(2)),
             receive: Arc::new(Semaphore::new(2)),
             peers: Mutex::new(BTreeMap::new()),
+            #[cfg(test)]
+            receive_pause: Mutex::new(None),
         }
     }
     async fn peer(&self, id: PeerId, send: bool) -> Result<Arc<Semaphore>> {
@@ -175,6 +232,21 @@ struct Dial {
     address: Multiaddr,
     reply: oneshot::Sender<Result<()>>,
     reserve: bool,
+}
+
+struct ProtocolReport {
+    peer: PeerId,
+    protocol: StreamProtocol,
+    outcome: ProtocolOutcome,
+    #[cfg(test)]
+    probe: Option<TestProbe>,
+}
+
+#[cfg(test)]
+struct TestProbe {
+    address: Option<Multiaddr>,
+    revalidate: bool,
+    reply: oneshot::Sender<BTreeSet<ConnectionId>>,
 }
 
 fn connection_state(
@@ -220,12 +292,16 @@ pub struct Node {
     pub control: Control,
     relay_control: Control,
     dial: mpsc::Sender<Dial>,
+    protocol_reports: mpsc::Sender<ProtocolReport>,
+    tasks: TaskTracker,
     pub addresses: watch::Receiver<Vec<Multiaddr>>,
     pub diagnostics: watch::Receiver<Diagnostics>,
     pub reachability: watch::Receiver<Reachability>,
     pub relay_addresses: watch::Receiver<Vec<Multiaddr>>,
     limits: Arc<Limits>,
     pub shutdown: CancellationToken,
+    #[cfg(test)]
+    nat_confirmations: watch::Receiver<usize>,
 }
 impl Node {
     pub async fn start(shared: Shared, discovery: bool) -> Result<Self> {
@@ -301,13 +377,24 @@ impl Node {
         let mut relay_control = swarm.behaviour().relay_streams.control();
         let mut incoming =
             futures::stream::select(control.accept(CONTROL)?, relay_control.accept(CONTROL)?);
-        let mut files = futures::stream::select(control.accept(FILE)?, relay_control.accept(FILE)?);
+        let mut files = futures::stream::select(
+            control
+                .accept(FILE)?
+                .map(|(peer, stream)| (peer, stream, false)),
+            relay_control
+                .accept(FILE)?
+                .map(|(peer, stream)| (peer, stream, true)),
+        );
         let mut contacts =
             futures::stream::select(control.accept(CONTACT)?, relay_control.accept(CONTACT)?);
         let (dial, mut dials) = mpsc::channel(128);
+        let (protocol_reports, mut reports) = mpsc::channel::<ProtocolReport>(128);
+        let tasks = TaskTracker::new();
         let (address_tx, addresses) = watch::channel(Vec::new());
         let (diagnostic_tx, diagnostics) = watch::channel(Diagnostics::new());
         let (reachability_tx, reachability) = watch::channel(Reachability::default());
+        #[cfg(test)]
+        let (nat_confirmations_tx, nat_confirmations) = watch::channel(0);
         let (relay_tx, relay_addresses) = watch::channel(Vec::new());
         let limits = Arc::new(Limits::new());
         let shutdown = CancellationToken::new();
@@ -315,10 +402,11 @@ impl Node {
         {
             let mut e = shared.lock().await;
             if let Err(err) = crate::relay_host::start(
-                e.key.clone(),
+                e.relay_key.clone(),
                 &e.persisted.network,
                 shutdown.clone(),
                 host_error,
+                &tasks,
             ) {
                 e.error(format!("Network assistance could not start: {err}"));
             }
@@ -328,17 +416,22 @@ impl Node {
             control: control.clone(),
             relay_control,
             dial,
+            protocol_reports,
+            tasks: tasks.clone(),
             addresses,
             diagnostics,
             reachability,
             relay_addresses,
             limits: limits.clone(),
             shutdown: shutdown.clone(),
+            #[cfg(test)]
+            nat_confirmations,
         };
         let poll_node = node.clone();
         let incoming_slots = Arc::new(Semaphore::new(32));
         let incoming_file_slots = Arc::new(Semaphore::new(8));
-        tokio::spawn(async move {
+        let actor_tasks = tasks.clone();
+        tasks.spawn(async move {
             let mut discovered = AddressBook::default();
             let in_flight = Arc::new(Mutex::new(BTreeSet::new()));
             let mut last_join = 0;
@@ -352,6 +445,18 @@ impl Node {
                 tokio::select! {
                     _ = shutdown.cancelled() => break,
                     Some(message) = host_errors.recv() => shared.lock().await.error(message),
+                    Some(report) = reports.recv() => {
+                        #[cfg(test)]
+                        if let Some(probe) = report.probe {
+                            swarm.behaviour_mut().autonat.test_probe(probe.address.as_ref(), probe.revalidate);
+                            let _ = probe.reply.send(connections.iter().filter(|(_, (peer, _))| *peer == report.peer).map(|(id, _)| *id).collect());
+                            continue;
+                        }
+                        diagnostic_tx.send_modify(|d| { if let Some(d) = diagnostic(d, report.peer) {
+                            d.last_protocol = Some(report.protocol.to_string());
+                            d.protocol_outcome = Some(report.outcome);
+                        } });
+                    },
                     Some(Dial { peer, address, reply, reserve }) = dials.recv() => {
                         let result = (|| {
                             discovered.remember(peer, address.clone())?;
@@ -379,19 +484,19 @@ impl Node {
                     Some((peer, stream)) = incoming.next() => {
                         if let Ok(permit) = incoming_slots.clone().try_acquire_owned() {
                             let state = shared.clone();
-                            tokio::spawn(async move { let _permit = permit; let _ = serve_control(state, peer, stream).await; });
+                            actor_tasks.spawn(async move { let _permit = permit; let _ = serve_control(state, peer, stream).await; });
                         }
                     },
-                    Some((peer, stream)) = files.next() => {
+                    Some((peer, stream, relayed)) = files.next() => {
                         if let Ok(permit) = incoming_file_slots.clone().try_acquire_owned() {
                             let state = shared.clone(); let limits = limits.clone();
-                            tokio::spawn(async move { let _permit = permit; let _ = serve_file(state, limits, peer, stream).await; });
+                            actor_tasks.spawn(async move { let _permit = permit; let _ = serve_file(state, limits, peer, stream, relayed).await; });
                         }
                     },
                     Some((peer, stream)) = contacts.next() => {
                         if let Ok(permit) = incoming_slots.clone().try_acquire_owned() {
                             let state = shared.clone();
-                            tokio::spawn(async move { let _permit = permit; let _ = serve_contacts(state, peer, stream).await; });
+                            actor_tasks.spawn(async move { let _permit = permit; let _ = serve_contacts(state, peer, stream).await; });
                         }
                     },
                     event = swarm.select_next_some() => match event {
@@ -407,11 +512,28 @@ impl Node {
                         SwarmEvent::ExpiredListenAddr { address, .. } => {
                             listeners.retain(|a| a != &address); let _ = address_tx.send(listeners.clone());
                             relay_tx.send_modify(|a| a.retain(|a| a != &address));
+                            if public.remove(&address) {
+                                swarm.remove_external_address(&address);
+                                let addresses = public.addresses();
+                                reachability_tx.send_replace(Reachability { status: if addresses.is_empty() { ReachabilityStatus::Unknown } else { ReachabilityStatus::Public }, public_addresses: addresses });
+                            }
+                        },
+                        SwarmEvent::ExternalAddrExpired { address } => {
+                            if public.remove(&address) {
+                                let addresses = public.addresses();
+                                reachability_tx.send_replace(Reachability { status: if addresses.is_empty() { ReachabilityStatus::Unknown } else { ReachabilityStatus::Public }, public_addresses: addresses });
+                            }
                         },
                         SwarmEvent::ListenerClosed { listener_id, addresses, .. } => {
                             reservations.retain(|_, id| *id != listener_id);
                             listeners.retain(|a| !addresses.contains(a)); let _ = address_tx.send(listeners.clone());
                             relay_tx.send_modify(|a| a.retain(|a| !addresses.contains(a)));
+                            let mut withdrawn = false;
+                            for address in &addresses { if public.remove(address) { swarm.remove_external_address(address); withdrawn = true; } }
+                            if withdrawn {
+                                let addresses = public.addresses();
+                                reachability_tx.send_replace(Reachability { status: if addresses.is_empty() { ReachabilityStatus::Unknown } else { ReachabilityStatus::Public }, public_addresses: addresses });
+                            }
                         },
                         SwarmEvent::Behaviour(BehaviourEvent::Mdns(mdns::Event::Discovered(peers))) => for (peer, address) in peers {
                             if discovered.remember(peer, address.clone()).is_ok_and(|added| added) {
@@ -443,6 +565,8 @@ impl Node {
                             }
                         },
                         SwarmEvent::Behaviour(BehaviourEvent::Autonat(event)) => {
+                            #[cfg(test)]
+                            if event.result.is_ok() { nat_confirmations_tx.send_modify(|count| *count += 1); }
                             // The library requires a matching nonce on an inbound dial-back,
                             // not just a server's claim that an address is reachable.
                             if let Ok(address) = direct_address(peer, event.tested_addr) {
@@ -450,7 +574,7 @@ impl Node {
                                 if event.result.is_err() { swarm.remove_external_address(&address); }
                                 let addresses = public.addresses();
                                 reachability_tx.send_replace(Reachability {
-                                    status: if !addresses.is_empty() { ReachabilityStatus::Public } else if event.result.is_err() { ReachabilityStatus::Unreachable } else { ReachabilityStatus::Unknown },
+                                    status: if !addresses.is_empty() { ReachabilityStatus::Public } else if event.result.as_ref().is_err_and(|error| !error.is_inconclusive()) { ReachabilityStatus::Unreachable } else { ReachabilityStatus::Unknown },
                                     public_addresses: addresses,
                                 });
                             }
@@ -498,7 +622,12 @@ impl Node {
                                 }
                             });
                             let mut e = shared.lock().await; e.online.remove(&peer_id.to_string()); e.remote.retain(|_,m| m.owner_peer_id != peer_id.to_string());
-                            for (id,t) in &e.transfers { if t.peer_id == peer_id.to_string() { if let Some(c) = e.cancellations.get(id) { c.cancel(); } } }
+                            let cancelled: Vec<_> = e.transfers.iter().filter(|(_, t)| t.peer_id == peer_id.to_string()).map(|(id, _)| *id).collect();
+                            for id in cancelled {
+                                if let Some(c) = e.cancellations.get(&id) { c.cancel();
+                                    if let Some(t) = e.transfers.get_mut(&id) { if t.relayed { t.error = Some(RELAY_INTERRUPTED.into()); } }
+                                }
+                            }
                             e.emit();
                         },
                         SwarmEvent::ListenerError { listener_id, .. } => {
@@ -517,6 +646,7 @@ impl Node {
                             reachability_tx.send_replace(Reachability { status: if addresses.is_empty() { ReachabilityStatus::Unknown } else { ReachabilityStatus::Public }, public_addresses: addresses });
                         }
                         let mut e = shared.lock().await;
+                        e.relay_peers = e.online.keys().filter_map(|p| p.parse().ok()).filter(|p| connection_state(&connections, *p) == ConnectionState::Relay).map(|p: PeerId| p.to_string()).collect();
                         let mut own_addresses: Vec<_> = reachability_tx.borrow().public_addresses.iter().chain(listeners.iter()).filter(|a| !is_relayed(a) && public_address(a)).filter_map(|a| peer_address(peer, a.clone()).ok()).map(|a| a.to_string()).collect();
                         own_addresses.sort(); own_addresses.dedup(); own_addresses.truncate(MAX_ADDRESSES - 3);
                         own_addresses.extend(relay_tx.borrow().iter().filter(|a| public_address(a)).filter_map(|a| peer_address(peer, a.clone()).ok()).map(|a| a.to_string()));
@@ -557,7 +687,7 @@ impl Node {
                             let mut ongoing = in_flight.lock().await;
                             if ongoing.insert(target) {
                                 let node = poll_node.clone(); let ongoing = in_flight.clone();
-                                tokio::spawn(async move { let _ = node.refresh_peer(target).await; ongoing.lock().await.remove(&target); });
+                                actor_tasks.spawn(async move { let _ = node.refresh_peer(target).await; ongoing.lock().await.remove(&target); });
                             }
                         }
                         if let Some(invite) = joining {
@@ -566,7 +696,7 @@ impl Node {
                                 if let Ok(target) = invite.owner_peer_id.parse::<PeerId>() {
                                     if connection_state(&connections, target) != ConnectionState::Offline {
                                         let mut ongoing = in_flight.lock().await;
-                                        if ongoing.insert(target) { let node = poll_node.clone(); let ongoing = in_flight.clone(); tokio::spawn(async move { let _ = node.poll_join(invite).await; ongoing.lock().await.remove(&target); }); }
+                                        if ongoing.insert(target) { let node = poll_node.clone(); let ongoing = in_flight.clone(); actor_tasks.spawn(async move { let _ = node.poll_join(invite).await; ongoing.lock().await.remove(&target); }); }
                                     }
                                 }
                             }
@@ -580,6 +710,7 @@ impl Node {
             }
             e.online.clear();
             e.remote.clear();
+            e.relay_peers.clear();
             e.network_status = "Offline".into();
             e.emit();
             diagnostic_tx.send_modify(|d| d.clear());
@@ -589,7 +720,7 @@ impl Node {
         let relay_node = node.clone();
         let configured = node.shared.lock().await.persisted.network.relays.clone();
         if !configured.is_empty() {
-            tokio::spawn(async move {
+            tasks.spawn(async move {
                 let mut tick = tokio::time::interval(Duration::from_secs(15));
                 let mut rotation = 0;
                 loop {
@@ -605,7 +736,7 @@ impl Node {
         }
         let refresh_shared = node.shared.clone();
         let refresh_shutdown = node.shutdown.clone();
-        tokio::spawn(async move {
+        tasks.spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(2));
             loop {
                 tokio::select! { _ = refresh_shutdown.cancelled() => break, _ = tick.tick() => {} }
@@ -679,11 +810,54 @@ impl Node {
         }
     }
     pub async fn request(&self, peer: PeerId, request: &Request) -> Result<Response> {
-        let mut control = self.stream_control(peer);
-        let mut stream =
-            tokio::time::timeout(PREAUTH_TIMEOUT, control.open_stream(peer, CONTROL)).await??;
+        let mut stream = self.open_stream(peer, CONTROL).await?;
         write_frame(&mut stream, request).await?;
         read_frame(&mut stream).await
+    }
+    async fn open_stream(&self, peer: PeerId, protocol: StreamProtocol) -> Result<Stream> {
+        let relayed = self
+            .diagnostics
+            .borrow()
+            .get(&peer)
+            .is_some_and(|d| d.state == ConnectionState::Relay);
+        self.open_stream_on_route(peer, protocol, relayed).await
+    }
+    async fn open_stream_on_route(
+        &self,
+        peer: PeerId,
+        protocol: StreamProtocol,
+        relayed: bool,
+    ) -> Result<Stream> {
+        let mut control = if relayed {
+            self.relay_control.clone()
+        } else {
+            self.control.clone()
+        };
+        let result =
+            tokio::time::timeout(PREAUTH_TIMEOUT, control.open_stream(peer, protocol.clone()))
+                .await;
+        let outcome = match &result {
+            Ok(Ok(_)) => ProtocolOutcome::Negotiated,
+            Ok(Err(libp2p_stream::OpenStreamError::UnsupportedProtocol(_))) => {
+                ProtocolOutcome::Unsupported
+            }
+            Ok(Err(_)) => ProtocolOutcome::Io,
+            Err(_) => ProtocolOutcome::Timeout,
+        };
+        // Bounded diagnostics contain protocol/outcome only, never request payloads.
+        let _ = self.protocol_reports.try_send(ProtocolReport {
+            peer,
+            protocol,
+            outcome,
+            #[cfg(test)]
+            probe: None,
+        });
+        Ok(result??)
+    }
+    pub async fn shutdown_and_wait(&self) {
+        self.shutdown.cancel();
+        self.tasks.close();
+        self.tasks.wait().await;
     }
     async fn poll_join(&self, invitation: Invitation) -> Result<()> {
         let peer = invitation.owner_peer_id.parse()?;
@@ -864,9 +1038,7 @@ impl Node {
         let mut offset = 0;
         let mut expected = None;
         loop {
-            let mut control = self.stream_control(peer);
-            let mut stream =
-                tokio::time::timeout(PREAUTH_TIMEOUT, control.open_stream(peer, CONTACT)).await??;
+            let mut stream = self.open_stream(peer, CONTACT).await?;
             write_frame(
                 &mut stream,
                 &ContactRequest {
@@ -904,6 +1076,7 @@ impl Node {
         Ok(())
     }
     pub async fn receive(&self, file_id: Uuid, directory: PathBuf) -> Result<Uuid> {
+        ensure!(!self.shutdown.is_cancelled(), "Node is shutting down");
         ensure!(directory.is_dir(), "Choose an existing destination folder");
         let (manifest, id, cancel) = {
             let mut e = self.shared.lock().await;
@@ -917,39 +1090,49 @@ impl Node {
             (manifest, id, cancel)
         };
         let node = self.clone();
-        tokio::spawn(async move {
+        self.tasks.spawn(async move {
             // Disk operations cannot be cancelled safely: finish them before cleanup.
-            let result = node.receive_inner(&manifest, &directory, id, &cancel).await;
+            let mut created = false;
+            let result = node
+                .receive_inner(&manifest, &directory, id, &cancel, &mut created)
+                .await;
             let part = directory.join(format!(".dump-{id}.part"));
             let mut e = node.shared.lock().await;
             let bytes = e.transfers.get(&id).map_or(0, |t| t.bytes);
             let cleaned = if result.is_err() {
-                match tokio::fs::remove_file(&part).await {
-                    Ok(()) => true,
-                    Err(err) => err.kind() == std::io::ErrorKind::NotFound,
-                }
+                remove_owned_partial(&part, created).await
             } else {
                 true
             };
             let mut next = e.persisted.clone();
             if cleaned {
                 next.partials.retain(|p| p != &part);
+            } else if created && !next.partials.contains(&part) {
+                next.partials.push(part.clone());
             }
             if let Err(err) = e.persist(next) {
                 e.error(format!("Cannot save download state: {err}"));
             }
             match result {
                 Ok(()) => e.mark_transfer(id, "Completed", manifest.size, None),
-                Err(err) => e.mark_transfer(
-                    id,
-                    if cancel.is_cancelled() {
-                        "Cancelled"
-                    } else {
-                        "Failed"
-                    },
-                    bytes,
-                    Some(err.to_string()),
-                ),
+                Err(err) => {
+                    let reason = e
+                        .transfers
+                        .get(&id)
+                        .and_then(|t| t.error.clone())
+                        .filter(|_| cancel.is_cancelled())
+                        .unwrap_or_else(|| err.to_string());
+                    e.mark_transfer(
+                        id,
+                        if cancel.is_cancelled() {
+                            "Cancelled"
+                        } else {
+                            "Failed"
+                        },
+                        bytes,
+                        Some(reason),
+                    )
+                }
             }
         });
         Ok(id)
@@ -960,6 +1143,7 @@ impl Node {
         directory: &Path,
         id: Uuid,
         cancel: &CancellationToken,
+        created: &mut bool,
     ) -> Result<()> {
         manifest.verify()?;
         let peer: PeerId = manifest.owner_peer_id.parse()?;
@@ -985,10 +1169,17 @@ impl Node {
             );
             snapshot
         };
-        let mut control = self.stream_control(peer);
+        let relayed = self
+            .diagnostics
+            .borrow()
+            .get(&peer)
+            .is_some_and(|d| d.state == ConnectionState::Relay);
+        if let Some(t) = self.shared.lock().await.transfers.get_mut(&id) {
+            t.relayed = relayed;
+        }
         let mut stream = tokio::select! {
             _ = cancel.cancelled() => bail!("Transfer cancelled"),
-            stream = tokio::time::timeout(PREAUTH_TIMEOUT, control.open_stream(peer, FILE)) => stream??,
+            stream = self.open_stream_on_route(peer, FILE, relayed) => stream.map_err(|e| relay_error(e, relayed))?,
         };
         write_frame(
             &mut stream,
@@ -997,8 +1188,12 @@ impl Node {
                 manifest: manifest.clone(),
             },
         )
-        .await?;
-        match read_frame(&mut stream).await? {
+        .await
+        .map_err(|e| relay_error(e, relayed))?;
+        match read_frame(&mut stream)
+            .await
+            .map_err(|e| relay_error(e, relayed))?
+        {
             Response::File { manifest: actual } => {
                 ensure!(
                     actual == *manifest,
@@ -1015,19 +1210,7 @@ impl Node {
         );
         let part = directory.join(format!(".dump-{id}.part"));
         ensure!(!cancel.is_cancelled(), "Transfer cancelled");
-        {
-            let mut e = self.shared.lock().await;
-            let mut next = e.persisted.clone();
-            next.partials.push(part.clone());
-            e.persist(next)?;
-            e.mark_transfer(id, "Receiving", 0, None);
-        }
-        let mut file = tokio::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&part)
-            .await
-            .context("Cannot create temporary download")?;
+        let mut file = create_owned_partial(&self.shared, &part, id, created).await?;
         let mut remaining = manifest.size;
         let mut total = 0;
         let mut hash = Sha256::new();
@@ -1037,12 +1220,24 @@ impl Node {
             let wanted = remaining.min(BLOCK as u64) as usize;
             tokio::select! {
                 _ = cancel.cancelled() => bail!("Transfer cancelled"),
-                read = tokio::time::timeout(INACTIVITY, stream.read_exact(&mut buffer[..wanted])) => read??,
+                read = tokio::time::timeout(INACTIVITY, stream.read_exact(&mut buffer[..wanted])) => read.map_err(anyhow::Error::from).and_then(|r| r.map_err(Into::into)).map_err(|e| relay_error(e, relayed))?,
             };
             DiskWrite::write_all(&mut file, &buffer[..wanted]).await?;
             hash.update(&buffer[..wanted]);
             remaining -= wanted as u64;
             total += wanted as u64;
+            #[cfg(test)]
+            if let Some(pause) = self.limits.receive_pause.lock().await.take() {
+                self.shared
+                    .lock()
+                    .await
+                    .mark_transfer(id, "Receiving", total, None);
+                let _ = pause.started.send(());
+                tokio::select! {
+                    _ = cancel.cancelled() => bail!("Transfer cancelled"),
+                    resumed = pause.resume => resumed?,
+                }
+            }
             if last.elapsed() >= Duration::from_millis(200) {
                 self.shared
                     .lock()
@@ -1059,7 +1254,7 @@ impl Node {
             matches!(
                 tokio::select! {
                     _ = cancel.cancelled() => bail!("Transfer cancelled"),
-                    response = read_frame::<_, Response>(&mut stream) => response?,
+                    response = read_frame::<_, Response>(&mut stream) => response.map_err(|e| relay_error(e, relayed))?,
                 },
                 Response::Done
             ),
@@ -1220,6 +1415,7 @@ async fn serve_file(
     limits: Arc<Limits>,
     peer: PeerId,
     mut stream: Stream,
+    relayed: bool,
 ) -> Result<()> {
     shared.lock().await.admit_request(&peer.to_string())?;
     let request: Request = read_frame(&mut stream).await?;
@@ -1252,6 +1448,9 @@ async fn serve_file(
         match result {
             Ok((manifest, share)) => {
                 let (id, cancel) = e.register_transfer(&manifest, &peer.to_string(), "Sharing");
+                if let Some(t) = e.transfers.get_mut(&id) {
+                    t.relayed = relayed;
+                }
                 (manifest, share, id, cancel)
             }
             Err(_) => {
@@ -1273,18 +1472,18 @@ async fn serve_file(
             let std_file = open_source(&share.path)?;
             ensure!(stamp(&std_file)? == share.stamp,"File changed; retry after refreshing");
             let mut file = tokio::fs::File::from_std(std_file);
-            write_frame(&mut stream,&Response::File {manifest:manifest.clone()}).await?;
+            write_frame(&mut stream,&Response::File {manifest:manifest.clone()}).await.map_err(|e| relay_error(e, relayed))?;
             shared.lock().await.mark_transfer(id,"Sharing",0,None);
             let mut hash = Sha256::new(); let mut total = 0; let mut buffer = vec![0;BLOCK]; let mut last = Instant::now();
             while total < manifest.size {
                 let wanted = (manifest.size-total).min(BLOCK as u64) as usize;
                 tokio::time::timeout(INACTIVITY,DiskRead::read_exact(&mut file,&mut buffer[..wanted])).await??;
-                tokio::time::timeout(INACTIVITY,stream.write_all(&buffer[..wanted])).await??;
+                tokio::time::timeout(INACTIVITY,stream.write_all(&buffer[..wanted])).await.map_err(anyhow::Error::from).and_then(|r| r.map_err(Into::into)).map_err(|e| relay_error(e, relayed))?;
                 hash.update(&buffer[..wanted]); total += wanted as u64;
                 if last.elapsed() >= Duration::from_millis(200) {shared.lock().await.mark_transfer(id,"Sharing",total,None); last = Instant::now();}
             }
             let mut extra = [0]; ensure!(DiskRead::read(&mut file,&mut extra).await? == 0 && hex::encode(hash.finalize()) == manifest.sha256,"Source file integrity changed");
-            write_frame(&mut stream,&Response::Done).await?; stream.close().await?;
+            write_frame(&mut stream,&Response::Done).await.map_err(|e| relay_error(e, relayed))?; stream.close().await.map_err(|e| relay_error(e.into(), relayed))?;
             Ok::<(),anyhow::Error>(())
         } => result,
     };
@@ -1293,7 +1492,12 @@ async fn serve_file(
     match result {
         Ok(()) => e.mark_transfer(id, "Completed", manifest.size, None),
         Err(err) => {
-            let message = err.to_string();
+            let message = e
+                .transfers
+                .get(&id)
+                .and_then(|t| t.error.clone())
+                .filter(|_| cancel.is_cancelled())
+                .unwrap_or_else(|| err.to_string());
             e.mark_transfer(
                 id,
                 if cancel.is_cancelled() {
@@ -1314,6 +1518,14 @@ async fn serve_file(
 }
 
 #[cfg(all(test, windows))]
+#[path = "network_identity_tests.rs"]
+mod identity_tests;
+
+#[cfg(all(test, windows))]
+#[path = "network_reachability_tests.rs"]
+mod reachability_tests;
+
+#[cfg(all(test, windows))]
 mod internet_tests {
     use super::*;
     use crate::{
@@ -1322,19 +1534,79 @@ mod internet_tests {
     };
     use libp2p::swarm::Swarm;
     async fn wait(shared: &Shared, predicate: impl Fn(&crate::engine::View) -> bool) -> Result<()> {
-        tokio::time::timeout(Duration::from_secs(25), async {
+        wait_stage("state transition", shared, None, predicate).await
+    }
+    async fn wait_stage(
+        stage: &str,
+        shared: &Shared,
+        node: Option<&Node>,
+        predicate: impl Fn(&crate::engine::View) -> bool,
+    ) -> Result<()> {
+        let (tx, mut changed) = watch::channel(());
+        let previous = {
+            let mut e = shared.lock().await;
+            let previous = e.notify.clone();
+            let notify = previous.clone();
+            e.notify = Arc::new(move |view| {
+                notify(view);
+                tx.send_replace(());
+            });
+            previous
+        };
+        let started = Instant::now();
+        let result = tokio::time::timeout(Duration::from_secs(25), async {
             loop {
-                if predicate(&shared.lock().await.view()) {
-                    break;
+                let view = shared.lock().await.view();
+                if predicate(&view) {
+                    break Ok(());
                 }
-                tokio::time::sleep(Duration::from_millis(20)).await;
+                if let Some(t) = view
+                    .transfers
+                    .iter()
+                    .find(|t| matches!(t.status.as_str(), "Failed" | "Cancelled"))
+                {
+                    bail!(
+                        "stage={stage}: transfer {} at {}/{} bytes: {}",
+                        t.status,
+                        t.bytes,
+                        t.total,
+                        t.error.as_deref().unwrap_or("no reason")
+                    );
+                }
+                changed.changed().await?;
             }
         })
-        .await?;
-        Ok(())
+        .await;
+        shared.lock().await.notify = previous;
+        if !matches!(result, Ok(Ok(()))) {
+            let e = shared.lock().await;
+            let view = e.view();
+            eprintln!("stage={stage} elapsed={:?} joining={} pending={} files={} online={} last_error={:?}", started.elapsed(), view.joining, view.pending.len(), view.files.len(), view.online.len(), view.last_error);
+            for t in &view.transfers {
+                eprintln!(
+                    "transfer status={} bytes={}/{} error={:?}",
+                    t.status, t.bytes, t.total, t.error
+                );
+            }
+            if let Some(node) = node {
+                for d in node.diagnostics.borrow().values() {
+                    eprintln!(
+                        "route={:?} identify={} protocol={:?} outcome={:?} dial={:?}",
+                        d.state, d.identified, d.last_protocol, d.protocol_outcome, d.last_failure
+                    );
+                }
+                eprintln!(
+                    "reservation locators={}",
+                    node.relay_addresses.borrow().len()
+                );
+            }
+        }
+        eprintln!("stage={stage} elapsed={:?}", started.elapsed());
+        result.with_context(|| format!("stage={stage}: state transition timed out"))?
     }
     async fn address<B: NetworkBehaviour>(swarm: &mut Swarm<B>) -> Result<Multiaddr> {
-        tokio::time::timeout(Duration::from_secs(10), async {
+        let started = Instant::now();
+        let result = tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 if let SwarmEvent::NewListenAddr { address, .. } = swarm.select_next_some().await {
                     break address;
@@ -1342,12 +1614,51 @@ mod internet_tests {
             }
         })
         .await
-        .map_err(Into::into)
+        .context("stage=relay listen");
+        eprintln!("stage=relay listen elapsed={:?}", started.elapsed());
+        result
+    }
+
+    #[derive(Default)]
+    struct Cleanup {
+        nodes: Vec<Node>,
+        relay_stop: CancellationToken,
+        host: Option<tokio::task::JoinHandle<()>>,
+    }
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            for node in &self.nodes {
+                node.shutdown.cancel();
+            }
+            self.relay_stop.cancel();
+            if let Some(host) = &self.host {
+                host.abort();
+            }
+        }
+    }
+    impl Cleanup {
+        async fn finish(&mut self) -> Result<()> {
+            for node in &self.nodes {
+                node.shutdown.cancel();
+            }
+            self.relay_stop.cancel();
+            for node in &self.nodes {
+                tokio::time::timeout(Duration::from_secs(10), node.shutdown_and_wait())
+                    .await
+                    .context("stage=node cleanup")?;
+            }
+            if let Some(host) = self.host.take() {
+                host.await?;
+            }
+            Ok(())
+        }
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn invite_locator_automatically_joins_and_transfers_and_contacts_stay_private(
     ) -> Result<()> {
         let root = tempfile::tempdir()?;
+        let mut cleanup = Cleanup::default();
+        let result: Result<()> = async {
         let owner = Engine::open(&root.path().join("owner"), Arc::new(|_| {}))?;
         let member = Engine::open(&root.path().join("member"), Arc::new(|_| {}))?;
         owner.lock().await.create_workspace("Internet".into())?;
@@ -1358,14 +1669,16 @@ mod internet_tests {
         relay.listen_on("/ip4/127.0.0.1/udp/0/quic-v1".parse()?)?;
         let relay_address = address(&mut relay).await?;
         relay.add_external_address(relay_address.clone());
-        let relay_stop = CancellationToken::new();
+        let relay_stop = cleanup.relay_stop.clone();
         let stop = relay_stop.clone();
-        let host = tokio::spawn(async move {
+        cleanup.host = Some(tokio::spawn(async move {
             loop {
                 tokio::select! { _ = stop.cancelled() => break, _ = relay.select_next_some() => {} }
             }
-        });
+        }));
         let a = Node::start(owner.clone(), false).await?;
+        cleanup.nodes.push(a.clone());
+        let started = Instant::now();
         a.reserve_relay(relay_peer, relay_address).await?;
         let mut addresses = a.relay_addresses.clone();
         let circuit = tokio::time::timeout(Duration::from_secs(10), async {
@@ -1376,7 +1689,8 @@ mod internet_tests {
                 addresses.changed().await?;
             }
         })
-        .await??;
+        .await.context("stage=owner reservation/circuit locator")??;
+        eprintln!("stage=owner reservation/circuit locator elapsed={:?} locators={}", started.elapsed(), a.relay_addresses.borrow().len());
         // Simulated relay address is injected only into this private unit harness.
         // Public invitation parsing and shipping Node::start always reject loopback contacts.
         invite.contact = Some(Contact::issue_routes(
@@ -1392,50 +1706,56 @@ mod internet_tests {
             e.persist(next)?;
         }
         let b = Node::start_inner(member.clone(), false, true).await?;
+        cleanup.nodes.push(b.clone());
+        let owner_peer = owner.lock().await.key.public().to_peer_id();
+        let started = Instant::now();
+        let mut diagnostics = b.diagnostics.clone();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if diagnostics.borrow().get(&owner_peer).is_some_and(|d| d.state == ConnectionState::Relay) { break Ok::<_, anyhow::Error>(()); }
+                diagnostics.changed().await?;
+            }
+        }).await.context("stage=member owner connection")??;
+        eprintln!("stage=member owner connection elapsed={:?} route=Relay", started.elapsed());
         let member_peer = member.lock().await.peer();
-        wait(&owner, |v| {
+        wait_stage("owner join request", &owner, Some(&b), |v| {
             v.pending.iter().any(|p| p.peer_id == member_peer)
         })
         .await?;
         owner.lock().await.approve(&member_peer)?;
-        wait(&member, |v| v.active.is_some() && !v.joining).await?;
+        wait_stage("member approval", &member, Some(&b), |v| v.active.is_some() && !v.joining).await?;
         let payload = vec![23; 2 * BLOCK + 17];
         let source = root.path().join("via-invite.bin");
         tokio::fs::write(&source, &payload).await?;
         share_paths(owner.clone(), vec![source]).await?;
-        wait(&member, |v| v.files.iter().any(|f| !f.mine)).await?;
+        wait_stage("member catalog/manifest", &member, Some(&b), |v| v.files.iter().any(|f| !f.mine)).await?;
         let file = member.lock().await.remote.values().next().unwrap().file_id;
         let output = root.path().join("output");
         tokio::fs::create_dir(&output).await?;
         let id = b.receive(file, output.clone()).await?;
-        wait(&member, |v| {
+        wait_stage("file transfer", &member, Some(&b), |v| {
             v.transfers
                 .iter()
                 .any(|t| t.id == id && t.status == "Completed")
         })
         .await?;
-        assert_eq!(
-            tokio::fs::read(output.join("via-invite.bin")).await?,
-            payload
-        );
+        ensure!(tokio::fs::read(output.join("via-invite.bin")).await? == payload, "stage=file verification: received bytes differ");
         let outsider = Engine::open(&root.path().join("outsider"), Arc::new(|_| {}))?;
         let c = Node::start(outsider, false).await?;
+        cleanup.nodes.push(c.clone());
         let owner_peer = owner.lock().await.key.public().to_peer_id();
         let route = a.relay_addresses.borrow()[0].clone();
         c.connect(owner_peer, route).await?;
+        let mut diagnostics = c.diagnostics.clone();
         tokio::time::timeout(Duration::from_secs(10), async {
-            while c
-                .diagnostics
-                .borrow()
-                .get(&owner_peer)
-                .is_none_or(|d| d.state != ConnectionState::Relay)
-            {
-                tokio::time::sleep(Duration::from_millis(20)).await;
+            loop {
+                if diagnostics.borrow().get(&owner_peer).is_some_and(|d| d.state == ConnectionState::Relay) { break Ok::<_, anyhow::Error>(()); }
+                diagnostics.changed().await?;
             }
         })
-        .await?;
-        let mut control = c.stream_control(owner_peer);
-        let mut stream = control.open_stream(owner_peer, CONTACT).await?;
+        .await.context("stage=outsider owner connection")??;
+        let mut stream = c.open_stream(owner_peer, CONTACT).await.context("stage=outsider contact negotiation")?;
+        let started = Instant::now();
         write_frame(
             &mut stream,
             &ContactRequest {
@@ -1449,12 +1769,12 @@ mod internet_tests {
             read_frame::<_, ContactResponse>(&mut stream).await.is_err(),
             "Nonmember must never receive contacts"
         );
-        a.shutdown.cancel();
-        b.shutdown.cancel();
-        c.shutdown.cancel();
-        relay_stop.cancel();
-        host.await?;
+        eprintln!("stage=outsider contact denied elapsed={:?}", started.elapsed());
         Ok(())
+        }.await;
+        let cleaned = cleanup.finish().await;
+        result?;
+        cleaned
     }
 
     #[derive(NetworkBehaviour)]
@@ -1582,6 +1902,60 @@ mod internet_tests {
         b.shutdown.cancel();
         stop.cancel();
         bad.await??;
+        Ok(())
+    }
+    #[test]
+    fn relay_errors_preserve_direct_and_validation_failures() {
+        let reset =
+            || anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
+        assert!(relay_error(reset(), true)
+            .to_string()
+            .contains("may have been reached"));
+        assert!(!relay_error(reset(), false).to_string().contains("Relay"));
+        assert_eq!(
+            relay_error(anyhow::anyhow!("File integrity verification failed"), true).to_string(),
+            "File integrity verification failed"
+        );
+        assert_eq!(
+            relay_error(anyhow::anyhow!("Access denied"), true).to_string(),
+            "Access denied"
+        );
+    }
+    #[tokio::test]
+    async fn partial_creation_collision_never_deletes_an_unowned_file() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let state = directory.path().join("state");
+        let shared = Engine::open(&state, Arc::new(|_| {}))?;
+        let id = Uuid::new_v4();
+        let part = directory.path().join(format!(".dump-{id}.part"));
+        tokio::fs::write(&part, b"existing unrelated bytes").await?;
+        let mut created = false;
+        ensure!(
+            create_owned_partial(&shared, &part, id, &mut created)
+                .await
+                .is_err(),
+            "collision unexpectedly succeeded"
+        );
+        ensure!(
+            !created && shared.lock().await.persisted.partials.is_empty(),
+            "unowned partial was recorded"
+        );
+        assert!(remove_owned_partial(&part, created).await);
+        let reopened = Engine::open(&state, Arc::new(|_| {}))?;
+        ensure!(
+            reopened.lock().await.persisted.partials.is_empty(),
+            "unowned partial persisted"
+        );
+        ensure!(
+            tokio::fs::read(&part).await? == b"existing unrelated bytes",
+            "unowned file changed after restart"
+        );
+        let owned = directory
+            .path()
+            .join(format!(".dump-{}.part", Uuid::new_v4()));
+        tokio::fs::write(&owned, b"Dump partial").await?;
+        assert!(remove_owned_partial(&owned, true).await);
+        assert!(!owned.exists());
         Ok(())
     }
     #[test]

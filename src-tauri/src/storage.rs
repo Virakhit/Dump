@@ -1,5 +1,7 @@
 use crate::model::{Persisted, VERSION};
 use anyhow::{ensure, Context, Result};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64, Engine};
+use libp2p::identity::Keypair;
 use std::{
     fs,
     io::Write,
@@ -24,13 +26,29 @@ impl Store {
         }
         let bytes = fs::read(&self.path)?;
         ensure!(bytes.len() <= 32 * 1024 * 1024, "Local state is too large");
-        let state: Persisted = serde_json::from_slice(&unprotect(&bytes)?)
+        let mut state: Persisted = serde_json::from_slice(&unprotect(&bytes)?)
             .context("Cannot read protected state; original data has been preserved")?;
         ensure!(state.version == VERSION, "Unsupported local state version");
         state.key()?;
         ensure!(state.contacts.len() <= 256, "Too many cached contacts");
         for workspace in state.workspaces.values() {
             workspace.snapshot.verify()?;
+        }
+        let migrated = state.relay_identity.is_empty();
+        if migrated {
+            state.relay_identity = B64.encode(Keypair::generate_ed25519().to_protobuf_encoding()?);
+            state.relay_identity_migrated =
+                state.network.help_network || !state.network.public_addresses.is_empty();
+            // Old host locators pin the app identity. Preserve their settings for
+            // explicit reconfiguration, but never silently restart that host.
+            state.network.help_network = false;
+        }
+        ensure!(
+            state.relay_key()?.public().to_peer_id() != state.key()?.public().to_peer_id(),
+            "Relay identity must differ from device identity"
+        );
+        if migrated {
+            self.save(&state)?;
         }
         Ok(state)
     }

@@ -50,3 +50,4 @@ tempfile = "3"
 
 [patch.crates-io]
 libp2p-stream = { path = "vendor/libp2p-stream" }
+libp2p-autonat = { path = "vendor/libp2p-autonat" }

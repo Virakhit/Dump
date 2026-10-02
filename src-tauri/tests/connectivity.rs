@@ -1,13 +1,91 @@
 #![cfg(windows)]
-use anyhow::{ensure, Result};
+use anyhow::{ensure, Context, Result};
 use dump_core::{
     connectivity::{ConnectionState, PeerDiagnostics},
-    engine::{share_paths, Engine},
+    engine::{share_paths, Engine, Shared, View},
     model::Invitation,
     network::{read_frame, write_frame, Node, Request, Response},
 };
 use libp2p::{swarm::StreamProtocol, Multiaddr, PeerId};
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
+use tokio::sync::watch;
+
+#[derive(Default)]
+struct Nodes(Vec<Node>);
+impl Drop for Nodes {
+    fn drop(&mut self) {
+        for node in &self.0 {
+            node.shutdown.cancel();
+        }
+    }
+}
+impl Nodes {
+    async fn close(&self) -> Result<()> {
+        for node in &self.0 {
+            node.shutdown.cancel();
+        }
+        for node in &self.0 {
+            tokio::time::timeout(Duration::from_secs(10), node.shutdown_and_wait())
+                .await
+                .context("LAN test node cleanup stage")?;
+        }
+        Ok(())
+    }
+}
+
+async fn lan_listener(node: &Node) -> Result<()> {
+    let mut addresses = node.addresses.clone();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if addresses.borrow().iter().any(|address| {
+                matches!(address.iter().next(), Some(libp2p::multiaddr::Protocol::Ip4(ip)) if !ip.is_loopback())
+                    && address.iter().any(|p| p == libp2p::multiaddr::Protocol::QuicV1)
+            }) { return Ok::<_, anyhow::Error>(()); }
+            addresses.changed().await?;
+        }
+    }).await.context("LAN non-loopback QUIC listener readiness stage")??;
+    Ok(())
+}
+
+async fn lan_state(
+    stage: &str,
+    deadline: Duration,
+    shared: &Shared,
+    changes: &mut watch::Receiver<()>,
+    observer: &Node,
+    remote: PeerId,
+    predicate: impl Fn(&View) -> bool,
+) -> Result<()> {
+    let started = Instant::now();
+    let mut diagnostics = observer.diagnostics.clone();
+    let result = tokio::time::timeout(deadline, async {
+        loop {
+            if predicate(&shared.lock().await.view()) {
+                return Ok::<_, anyhow::Error>(());
+            }
+            tokio::select! {
+                changed = changes.changed() => changed?,
+                changed = diagnostics.changed() => changed?,
+            }
+        }
+    })
+    .await;
+    if result.is_err() {
+        let view = shared.lock().await.view();
+        let peer = diagnostics
+            .borrow()
+            .get(&remote)
+            .cloned()
+            .unwrap_or_default();
+        anyhow::bail!("stage={stage} timeout after {:?}: listeners={} network={} joining={} pending={} route={:?} identified={} protocol={:?} outcome={:?} dial={:?}", started.elapsed(), observer.addresses.borrow().len(), view.network_status, view.joining, view.pending.len(), peer.state, peer.identified, peer.last_protocol, peer.protocol_outcome, peer.last_failure);
+    }
+    result??;
+    eprintln!("stage={stage} elapsed={:?}", started.elapsed());
+    Ok(())
+}
 
 async fn address(node: &Node) -> Result<Multiaddr> {
     let mut addresses = node.addresses.clone();
@@ -167,44 +245,77 @@ async fn mismatched_transport_identity_never_connects() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn lan_mdns_still_finds_invited_owner_without_explicit_addresses() -> Result<()> {
     let root = tempfile::tempdir()?;
-    let owner = Engine::open(&root.path().join("owner"), Arc::new(|_| {}))?;
-    let member = Engine::open(&root.path().join("member"), Arc::new(|_| {}))?;
-    owner.lock().await.create_workspace("LAN".into())?;
-    member
-        .lock()
-        .await
-        .join(&owner.lock().await.create_invite()?)?;
-    let a = Node::start(owner.clone(), true).await?;
-    let b = Node::start(member.clone(), true).await?;
-    let member_id = member.lock().await.peer();
-    tokio::time::timeout(Duration::from_secs(30), async {
-        loop {
-            if owner.lock().await.pending.contains_key(&member_id) {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
+    let (owner_changes, mut owner_updates) = watch::channel(());
+    let (member_changes, mut member_updates) = watch::channel(());
+    let owner = Engine::open(
+        &root.path().join("owner"),
+        Arc::new(move |_| {
+            owner_changes.send_replace(());
+        }),
+    )?;
+    let member = Engine::open(
+        &root.path().join("member"),
+        Arc::new(move |_| {
+            member_changes.send_replace(());
+        }),
+    )?;
+    let mut nodes = Nodes::default();
+    let result = async {
+        owner.lock().await.create_workspace("LAN".into())?;
+        member
+            .lock()
+            .await
+            .join(&owner.lock().await.create_invite()?)?;
+        let a = Node::start(owner.clone(), true).await?;
+        nodes.0.push(a.clone());
+        // mDNS advertises only transport addresses matching its non-loopback interface.
+        // Make the owner's listener real before the joining node starts discovering.
+        lan_listener(&a).await?;
+        let b = Node::start(member.clone(), true).await?;
+        nodes.0.push(b.clone());
+        lan_listener(&b).await?;
+        let member_id = member.lock().await.peer();
+        let owner_peer = owner.lock().await.key.public().to_peer_id();
+        lan_state(
+            "mDNS owner discovery / application join request",
+            Duration::from_secs(30),
+            &owner,
+            &mut owner_updates,
+            &b,
+            owner_peer,
+            |view| {
+                view.pending
+                    .iter()
+                    .any(|pending| pending.peer_id == member_id)
+            },
+        )
+        .await?;
+        owner.lock().await.approve(&member_id)?;
+        lan_state(
+            "LAN signed approval",
+            Duration::from_secs(15),
+            &member,
+            &mut member_updates,
+            &b,
+            owner_peer,
+            |view| view.active.is_some() && !view.joining,
+        )
+        .await?;
+        ensure!(
+            member.lock().await.active_snapshot()?.contains(&member_id),
+            "LAN approval missing"
+        );
+        Ok(())
+    }
+    .await;
+    let closed = nodes.close().await;
+    match (result, closed) {
+        (Err(error), Err(cleanup)) => {
+            Err(error.context(format!("LAN cleanup also failed: {cleanup:#}")))
         }
-    })
-    .await?;
-    owner.lock().await.approve(&member_id)?;
-    tokio::time::timeout(Duration::from_secs(15), async {
-        loop {
-            let e = member.lock().await;
-            if e.persisted.active.is_some() && e.persisted.joining.is_none() {
-                break;
-            }
-            drop(e);
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await?;
-    ensure!(
-        member.lock().await.active_snapshot()?.contains(&member_id),
-        "LAN approval missing"
-    );
-    a.shutdown.cancel();
-    b.shutdown.cancel();
-    Ok(())
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Ok(()), Ok(())) => Ok(()),
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

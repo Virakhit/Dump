@@ -35,6 +35,14 @@ pub enum DialFailure {
     Unreachable,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProtocolOutcome {
+    Negotiated,
+    Unsupported,
+    Timeout,
+    Io,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct PeerDiagnostics {
     pub state: ConnectionState,
@@ -45,6 +53,8 @@ pub struct PeerDiagnostics {
     pub advertised_addresses: Vec<Multiaddr>,
     pub hole_punch_succeeded: Option<bool>,
     pub supports_contacts: bool,
+    pub last_protocol: Option<String>,
+    pub protocol_outcome: Option<ProtocolOutcome>,
 }
 
 pub type Diagnostics = BTreeMap<PeerId, PeerDiagnostics>;

@@ -84,6 +84,7 @@ mod tests {
                 name: "file".into(),
                 peer_id: "peer".into(),
                 direction: "Receiving".into(),
+                relayed: false,
                 bytes: 0,
                 total: 1,
                 status: "Queued".into(),
@@ -145,10 +146,17 @@ async fn save_network(
 ) -> Result<(), String> {
     let mut e = state.shared.lock().await;
     settings
-        .validate(e.key.public().to_peer_id())
+        .validate(
+            e.persisted
+                .relay_key()
+                .map_err(|err| err.to_string())?
+                .public()
+                .to_peer_id(),
+        )
         .map_err(|err| err.to_string())?;
     let mut next = e.persisted.clone();
     next.network = settings;
+    next.relay_identity_migrated = false;
     e.persist(next).map_err(|err| err.to_string())?;
     e.emit();
     Ok(())

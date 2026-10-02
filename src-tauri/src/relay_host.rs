@@ -341,6 +341,7 @@ pub(crate) fn start(
     settings: &Settings,
     shutdown: CancellationToken,
     errors: tokio::sync::mpsc::Sender<&'static str>,
+    tasks: &tokio_util::task::TaskTracker,
 ) -> Result<()> {
     if !settings.help_network {
         return Ok(());
@@ -353,7 +354,7 @@ pub(crate) fn start(
     for address in &settings.public_addresses {
         swarm.add_external_address(direct_address(peer, address.parse()?)?);
     }
-    tokio::spawn(async move {
+    tasks.spawn(async move {
         loop {
             tokio::select! { _ = shutdown.cancelled() => break, event = swarm.select_next_some() => {
                 if matches!(event, libp2p::swarm::SwarmEvent::ListenerError { .. } | libp2p::swarm::SwarmEvent::ListenerClosed { .. }) {
@@ -427,126 +428,9 @@ mod tests {
     #[cfg(windows)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn host_rejects_excess_reservations_and_stops_over_budget_payload() -> Result<()> {
-        use crate::{
-            engine::{share_paths, Engine},
-            model::BLOCK,
-            network::Node,
-        };
-        use libp2p::swarm::SwarmEvent;
-        let key = Keypair::generate_ed25519();
-        let relay_peer = key.public().to_peer_id();
-        let mut cfg = config();
-        cfg.max_reservations = 1;
-        cfg.max_circuits = 1;
-        cfg.max_circuit_bytes = 128 * 1024;
-        let mut relay = swarm(key, cfg)?;
-        relay.listen_on("/ip4/127.0.0.1/udp/0/quic-v1".parse()?)?;
-        let address = loop {
-            if let SwarmEvent::NewListenAddr { address, .. } = relay.select_next_some().await {
-                break address;
-            }
-        };
-        relay.add_external_address(address.clone()); // Isolated test, never shipping advertisement.
-        let stop = CancellationToken::new();
-        let task_stop = stop.clone();
-        let (denied_tx, mut denied) = tokio::sync::watch::channel(false);
-        let host = tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = task_stop.cancelled() => break,
-                    event = relay.select_next_some() => {
-                        if matches!(event, SwarmEvent::Behaviour(HostEvent::Relay(relay::Event::ReservationReqDenied { .. }))) { denied_tx.send_replace(true); }
-                    }
-                }
-            }
-        });
-        let root = tempfile::tempdir()?;
-        let owner = Engine::open(&root.path().join("owner"), Arc::new(|_| {}))?;
-        let member = Engine::open(&root.path().join("member"), Arc::new(|_| {}))?;
-        let outsider = Engine::open(&root.path().join("outsider"), Arc::new(|_| {}))?;
-        owner.lock().await.create_workspace("Limits".into())?;
-        let invite = owner.lock().await.create_invite()?;
-        member.lock().await.join(&invite)?;
-        let a = Node::start(owner.clone(), false).await?;
-        let b = Node::start(member.clone(), false).await?;
-        let c = Node::start(outsider, false).await?;
-        a.reserve_relay(relay_peer, address.clone()).await?;
-        let mut routes = a.relay_addresses.clone();
-        let route = tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                if let Some(address) = routes.borrow().first().cloned() {
-                    break Ok::<_, anyhow::Error>(address);
-                }
-                routes.changed().await?;
-            }
-        })
-        .await??;
-        c.reserve_relay(relay_peer, address).await?;
-        tokio::time::timeout(Duration::from_secs(10), async {
-            while !*denied.borrow() {
-                denied.changed().await?;
-            }
-            Ok::<_, anyhow::Error>(())
-        })
-        .await??;
-        assert!(c.relay_addresses.borrow().is_empty());
-        let owner_peer = owner.lock().await.key.public().to_peer_id();
-        let member_peer = member.lock().await.peer();
-        b.connect(owner_peer, route).await?;
-        tokio::time::timeout(Duration::from_secs(15), async {
-            loop {
-                if owner.lock().await.pending.contains_key(&member_peer) {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await?;
-        owner.lock().await.approve(&member_peer)?;
-        tokio::time::timeout(Duration::from_secs(15), async {
-            while member.lock().await.persisted.joining.is_some() {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await?;
-        let source = root.path().join("limited.bin");
-        tokio::fs::write(&source, vec![7; BLOCK]).await?;
-        share_paths(owner.clone(), vec![source]).await?;
-        tokio::time::timeout(Duration::from_secs(15), async {
-            while member.lock().await.remote.is_empty() {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await?;
-        let file = member.lock().await.remote.values().next().unwrap().file_id;
-        let output = root.path().join("output");
-        tokio::fs::create_dir(&output).await?;
-        let id = b.receive(file, output.clone()).await?;
-        tokio::time::timeout(Duration::from_secs(15), async {
-            loop {
-                let e = member.lock().await;
-                if e.transfers
-                    .get(&id)
-                    .is_some_and(|t| ["Failed", "Cancelled"].contains(&t.status.as_str()))
-                {
-                    break;
-                }
-                drop(e);
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await?;
-        assert!(tokio::fs::read_dir(&output)
-            .await?
-            .next_entry()
-            .await?
-            .is_none());
-        assert!(member.lock().await.persisted.partials.is_empty());
-        a.shutdown.cancel();
-        b.shutdown.cancel();
-        c.shutdown.cancel();
-        stop.cancel();
-        host.await?;
-        Ok(())
+        super::transfer_tests::excess_reservations_and_payload_limit().await
     }
 }
+
+#[cfg(all(test, windows))]
+mod transfer_tests;

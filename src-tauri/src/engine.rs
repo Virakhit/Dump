@@ -46,6 +46,7 @@ pub struct Transfer {
     pub name: String,
     pub peer_id: String,
     pub direction: String,
+    pub relayed: bool,
     pub bytes: u64,
     pub total: u64,
     pub status: String,
@@ -54,6 +55,8 @@ pub struct Transfer {
 #[derive(Clone, Serialize)]
 pub struct View {
     pub peer_id: String,
+    pub relay_peer_id: String,
+    pub relay_identity_migrated: bool,
     pub fingerprint: String,
     pub device_name: String,
     pub active: Option<Uuid>,
@@ -64,6 +67,7 @@ pub struct View {
     pub preparing: Vec<String>,
     pub joining: bool,
     pub network_status: String,
+    pub relay_peers: Vec<String>,
     pub transfers: Vec<Transfer>,
     pub invite_url: Option<String>,
     pub last_error: Option<String>,
@@ -73,6 +77,7 @@ pub struct View {
 pub struct Engine {
     pub persisted: Persisted,
     pub key: Keypair,
+    pub relay_key: Keypair,
     pub store: Store,
     pub pending: BTreeMap<String, Pending>,
     pub remote: BTreeMap<Uuid, Manifest>,
@@ -82,6 +87,7 @@ pub struct Engine {
     pub cancellations: BTreeMap<Uuid, CancellationToken>,
     pub preparing: Vec<String>,
     pub network_status: String,
+    pub relay_peers: Vec<String>,
     pub invite_url: Option<String>,
     pub last_error: Option<String>,
     pub notify: Notify,
@@ -104,9 +110,11 @@ impl Engine {
         });
         store.save(&persisted)?;
         let key = persisted.key()?;
+        let relay_key = persisted.relay_key()?;
         Ok(Arc::new(Mutex::new(Self {
             persisted,
             key,
+            relay_key,
             store,
             pending: BTreeMap::new(),
             remote: BTreeMap::new(),
@@ -116,6 +124,7 @@ impl Engine {
             cancellations: BTreeMap::new(),
             preparing: Vec::new(),
             network_status: "Starting LAN discovery…".into(),
+            relay_peers: Vec::new(),
             invite_url: None,
             last_error: None,
             notify,
@@ -188,6 +197,8 @@ impl Engine {
         files.sort_by(|a, b| a.manifest.name.cmp(&b.manifest.name));
         View {
             peer_id: peer.clone(),
+            relay_peer_id: self.relay_key.public().to_peer_id().to_string(),
+            relay_identity_migrated: self.persisted.relay_identity_migrated,
             fingerprint: digest(&self.key.public().encode_protobuf()),
             device_name: self.persisted.device_name.clone(),
             active: self.persisted.active,
@@ -211,6 +222,7 @@ impl Engine {
             preparing: self.preparing.clone(),
             joining: self.persisted.joining.is_some(),
             network_status: self.network_status.clone(),
+            relay_peers: self.relay_peers.clone(),
             transfers: self.transfers.values().cloned().collect(),
             invite_url: self.invite_url.clone(),
             last_error: self.last_error.clone(),
@@ -277,6 +289,7 @@ impl Engine {
         }
         self.remote.clear();
         self.online.clear();
+        self.relay_peers.clear();
         self.invite_url = None;
     }
     pub fn create_invite(&mut self) -> Result<String> {
@@ -662,6 +675,7 @@ impl Engine {
                 name: manifest.name.clone(),
                 peer_id: peer.into(),
                 direction: direction.into(),
+                relayed: false,
                 bytes: 0,
                 total: manifest.size,
                 status: "Queued".into(),

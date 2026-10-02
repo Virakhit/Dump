@@ -248,6 +248,10 @@ pub struct LocalShare {
 pub struct Persisted {
     pub version: u8,
     pub identity: String,
+    #[serde(default)]
+    pub relay_identity: String,
+    #[serde(default)]
+    pub relay_identity_migrated: bool,
     pub device_name: String,
     pub active: Option<Uuid>,
     pub workspaces: BTreeMap<Uuid, Workspace>,
@@ -266,6 +270,8 @@ impl Persisted {
         Ok(Self {
             version: VERSION,
             identity: B64.encode(Keypair::generate_ed25519().to_protobuf_encoding()?),
+            relay_identity: B64.encode(Keypair::generate_ed25519().to_protobuf_encoding()?),
+            relay_identity_migrated: false,
             device_name: "My device".into(),
             active: None,
             workspaces: BTreeMap::new(),
@@ -281,6 +287,11 @@ impl Persisted {
     pub fn key(&self) -> Result<Keypair> {
         Ok(Keypair::from_protobuf_encoding(
             &B64.decode(&self.identity)?,
+        )?)
+    }
+    pub fn relay_key(&self) -> Result<Keypair> {
+        Ok(Keypair::from_protobuf_encoding(
+            &B64.decode(&self.relay_identity)?,
         )?)
     }
     pub fn peer_id(&self) -> Result<String> {

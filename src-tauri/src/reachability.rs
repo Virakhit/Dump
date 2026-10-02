@@ -15,14 +15,21 @@ use std::{
 };
 
 const VALID_FOR: Duration = Duration::from_secs(10 * 60);
+const RECHECK_AFTER: Duration = Duration::from_secs(5 * 60);
+
+struct Candidate {
+    observed: Instant,
+    recheck: Instant,
+}
 
 /// AutoNAT's candidate limit bounds each probe batch, not its address cache.
 /// Filter and deduplicate before the behaviour sees any untrusted observations.
 pub(crate) struct Client {
     inner: autonat::v2::client::Behaviour,
     peer: PeerId,
-    candidates: BTreeSet<Multiaddr>,
+    candidates: BTreeMap<Multiaddr, Candidate>,
     connections: BTreeSet<ConnectionId>,
+    listeners: BTreeSet<Multiaddr>,
     #[cfg(test)]
     allow_loopback: bool,
 }
@@ -32,26 +39,72 @@ impl Client {
         Self {
             inner: Default::default(),
             peer,
-            candidates: BTreeSet::new(),
+            candidates: BTreeMap::new(),
             connections: BTreeSet::new(),
+            listeners: BTreeSet::new(),
             #[cfg(test)]
             allow_loopback: false,
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_probe(&mut self, address: Option<&Multiaddr>, revalidate: bool) {
+        if let Some(address) = address {
+            self.allow_loopback = true;
+            self.on_swarm_event(FromSwarm::NewExternalAddrCandidate(
+                NewExternalAddrCandidate { addr: address },
+            ));
+        }
+        if revalidate {
+            self.revalidate(Instant::now() + RECHECK_AFTER);
+        }
+    }
+
     fn candidate(&mut self, address: &Multiaddr) -> Option<Multiaddr> {
+        self.candidate_at(address, Instant::now())
+    }
+
+    fn candidate_at(&mut self, address: &Multiaddr, at: Instant) -> Option<Multiaddr> {
         let address = direct_address(self.peer, address.clone()).ok()?;
         let allowed = public_address(&address);
         #[cfg(test)]
         let allowed = allowed || self.allow_loopback;
-        if !allowed || self.candidates.len() >= MAX_ADDRESSES || self.candidates.contains(&address)
-        {
+        if !allowed {
             return None;
         }
-        // ponytail: eight distinct candidates per connected lifetime; reset after all
-        // connections close. Add upstream cache eviction if real address churn hits this cap.
-        self.candidates.insert(address.clone());
+        self.revalidate(at);
+        if let Some(candidate) = self.candidates.get_mut(&address) {
+            candidate.observed = at;
+            return None;
+        }
+        if self.candidates.len() >= MAX_ADDRESSES {
+            return None;
+        }
+        self.candidates.insert(
+            address.clone(),
+            Candidate {
+                observed: at,
+                recheck: at + RECHECK_AFTER,
+            },
+        );
         Some(address)
+    }
+
+    fn revalidate(&mut self, at: Instant) {
+        self.candidates.retain(|address, candidate| {
+            if self.listeners.contains(address) {
+                candidate.observed = at;
+            }
+            if at.saturating_duration_since(candidate.observed) >= VALID_FOR
+                && self.inner.remove_candidate(address)
+            {
+                return false;
+            }
+            if at >= candidate.recheck && self.inner.retry_candidate(address) {
+                candidate.recheck = at + RECHECK_AFTER;
+            }
+            true
+        });
     }
 }
 
@@ -85,6 +138,21 @@ impl NetworkBehaviour for Client {
 
     fn on_swarm_event(&mut self, event: FromSwarm) {
         match event {
+            FromSwarm::NewListenAddr(e) => {
+                if let Ok(address) = direct_address(self.peer, e.addr.clone()) {
+                    if public_address(&address) && self.listeners.len() < MAX_ADDRESSES {
+                        self.listeners.insert(address);
+                    }
+                }
+            }
+            FromSwarm::ExpiredListenAddr(e) => {
+                self.listeners.remove(e.addr);
+                if self.inner.remove_candidate(e.addr) {
+                    self.candidates.remove(e.addr);
+                } else if let Some(candidate) = self.candidates.get_mut(e.addr) {
+                    candidate.observed = Instant::now() - VALID_FOR;
+                }
+            }
             FromSwarm::NewExternalAddrCandidate(NewExternalAddrCandidate { addr }) => {
                 if let Some(address) = self.candidate(addr) {
                     self.inner
@@ -103,10 +171,6 @@ impl NetworkBehaviour for Client {
             _ => {}
         }
         self.inner.on_swarm_event(event);
-        if matches!(event, FromSwarm::ConnectionClosed(_)) && self.connections.is_empty() {
-            self.inner = Default::default();
-            self.candidates.clear();
-        }
     }
 
     fn on_connection_handler_event(
@@ -122,7 +186,19 @@ impl NetworkBehaviour for Client {
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<ToSwarm<Self::ToSwarm, THandlerInEvent<Self>>> {
-        self.inner.poll(cx)
+        let at = Instant::now();
+        // The existing AutoNAT probe timer wakes this poll even when no peer disconnects.
+        self.revalidate(at);
+        let event = self.inner.poll(cx);
+        if let Poll::Ready(ToSwarm::GenerateEvent(event)) = &event {
+            if let Some(candidate) = self.candidates.get_mut(&event.tested_addr) {
+                candidate.recheck = at + RECHECK_AFTER;
+                if event.result.is_ok() {
+                    candidate.observed = at;
+                }
+            }
+        }
+        event
     }
 }
 
@@ -131,6 +207,10 @@ impl NetworkBehaviour for Client {
 pub(crate) struct PublicAddresses(BTreeMap<Multiaddr, (PeerId, Instant)>);
 
 impl PublicAddresses {
+    pub fn remove(&mut self, address: &Multiaddr) -> bool {
+        self.0.remove(address).is_some()
+    }
+
     pub fn record(&mut self, peer: PeerId, address: Multiaddr, verified: bool, at: Instant) {
         if !verified {
             self.0.remove(&address);
@@ -172,12 +252,14 @@ mod tests {
     struct ProbeClient {
         nat: Client,
         identify: identify::Behaviour,
+        streams: libp2p_stream::Behaviour,
     }
 
     #[derive(NetworkBehaviour)]
     struct ProbeServer {
         nat: autonat::v2::server::Behaviour,
         identify: identify::Behaviour,
+        streams: libp2p_stream::Behaviour,
     }
 
     fn identify(key: &libp2p::identity::Keypair) -> identify::Behaviour {
@@ -229,6 +311,102 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn long_lived_candidates_recheck_and_expire_with_bounded_address_churn() -> Result<()> {
+        let peer = libp2p::identity::Keypair::generate_ed25519()
+            .public()
+            .to_peer_id();
+        let mut client = Client::new(peer);
+        let address: Multiaddr = "/ip4/8.8.8.8/udp/9000/quic-v1".parse()?;
+        let at = Instant::now();
+        client.candidate_at(&address, at);
+        client
+            .inner
+            .on_swarm_event(FromSwarm::NewExternalAddrCandidate(
+                NewExternalAddrCandidate { addr: &address },
+            ));
+        // A permanently open transport does not gate the re-probe schedule.
+        client.connections.insert(ConnectionId::new_unchecked(1));
+        client.revalidate(at + RECHECK_AFTER - Duration::from_secs(1));
+        assert_eq!(client.candidates[&address].recheck, at + RECHECK_AFTER);
+        client.revalidate(at + RECHECK_AFTER);
+        assert_eq!(client.candidates[&address].recheck, at + RECHECK_AFTER * 2);
+        assert_eq!(client.connections.len(), 1);
+        client.revalidate(at + VALID_FOR);
+        assert!(client.candidates.is_empty());
+        for cycle in 1..=32 {
+            let now = at + VALID_FOR * cycle;
+            for port in 1..=MAX_ADDRESSES + 1 {
+                client.candidate_at(&format!("/ip4/8.8.8.8/udp/{port}/quic-v1").parse()?, now);
+            }
+            assert_eq!(client.candidates.len(), MAX_ADDRESSES);
+        }
+        assert_eq!(client.connections.len(), 1);
+        // A still-listening public route can be retried when a server appears much later.
+        let listener: Multiaddr = "/ip4/8.8.8.8/tcp/4242".parse()?;
+        client.revalidate(at + VALID_FOR * 34);
+        client.candidate_at(&listener, at + VALID_FOR * 34);
+        client
+            .inner
+            .on_swarm_event(FromSwarm::NewExternalAddrCandidate(
+                NewExternalAddrCandidate { addr: &listener },
+            ));
+        client.listeners.insert(listener.clone());
+        client.revalidate(at + VALID_FOR * 40);
+        assert!(client.candidates.contains_key(&listener));
+        client.listeners.remove(&listener);
+        client.revalidate(at + VALID_FOR * 41);
+        assert!(!client.candidates.contains_key(&listener));
+        Ok(())
+    }
+
+    #[test]
+    fn renewed_evidence_extends_ttl_and_failed_reprobe_withdraws_it() -> Result<()> {
+        let peer = libp2p::identity::Keypair::generate_ed25519()
+            .public()
+            .to_peer_id();
+        let address: Multiaddr = "/ip4/8.8.8.8/udp/9000/quic-v1".parse()?;
+        let at = Instant::now();
+        let mut public = PublicAddresses::default();
+        public.record(peer, address.clone(), true, at);
+        public.record(peer, address.clone(), true, at + RECHECK_AFTER);
+        assert!(public.expire(None, at + VALID_FOR).is_empty());
+        public.record(peer, address.clone(), false, at + VALID_FOR);
+        assert!(public.addresses().is_empty());
+        public.record(peer, address.clone(), true, at);
+        assert_eq!(public.expire(None, at + VALID_FOR), vec![address]);
+        Ok(())
+    }
+
+    #[test]
+    fn persistent_public_listener_without_probe_server_has_no_confirmation() -> Result<()> {
+        let peer = libp2p::identity::Keypair::generate_ed25519()
+            .public()
+            .to_peer_id();
+        let mut client = Client::new(peer);
+        let address: Multiaddr = "/ip4/8.8.8.8/tcp/4242".parse()?;
+        let at = Instant::now();
+        client.on_swarm_event(FromSwarm::NewListenAddr(libp2p::swarm::NewListenAddr {
+            listener_id: libp2p::core::transport::ListenerId::next(),
+            addr: &address,
+        }));
+        client.on_swarm_event(FromSwarm::NewExternalAddrCandidate(
+            NewExternalAddrCandidate { addr: &address },
+        ));
+        client.revalidate(at + VALID_FOR * 40);
+        assert!(client.candidates.contains_key(&address));
+        assert!(client.connections.is_empty());
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        // No probe server or inbound nonce can create a confirmed advertisement.
+        assert!(client.poll(&mut cx).is_pending());
+        assert!(PublicAddresses::default().addresses().is_empty());
+        assert_eq!(
+            crate::connectivity::Reachability::default().status,
+            crate::connectivity::ReachabilityStatus::Unknown
+        );
+        Ok(())
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn real_autonat_v2_dialback_confirms_only_reachable_listener() -> Result<()> {
         let key = libp2p::identity::Keypair::generate_ed25519();
@@ -243,6 +421,7 @@ mod tests {
                 ProbeClient {
                     nat: behaviour,
                     identify: identify(key),
+                    streams: libp2p_stream::Behaviour::new(),
                 }
             })?
             .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(30)))
@@ -253,6 +432,7 @@ mod tests {
             .with_behaviour(|key| ProbeServer {
                 nat: Default::default(),
                 identify: identify(key),
+                streams: libp2p_stream::Behaviour::new(),
             })?
             .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(30)))
             .build();
@@ -314,6 +494,89 @@ mod tests {
         }).await?;
         assert!(client.external_addresses().any(|a| a == &client_address));
         assert!(!client.external_addresses().any(|a| a == &unavailable));
+
+        use futures::{AsyncReadExt, AsyncWriteExt};
+        let protocol = libp2p::StreamProtocol::new("/dump/test/revalidation-transfer/1");
+        let mut incoming = server
+            .behaviour_mut()
+            .streams
+            .new_control()
+            .accept(protocol.clone())?;
+        let server_peer = *server.local_peer_id();
+        let mut control = client.behaviour_mut().streams.new_control();
+        let (started_tx, mut started_rx) = tokio::sync::oneshot::channel();
+        let (continue_tx, continue_rx) = tokio::sync::oneshot::channel();
+        // JoinSet aborts both stream tasks on any assertion, failure or timeout.
+        let mut transfers = tokio::task::JoinSet::new();
+        transfers.spawn(async move {
+            let mut stream = control.open_stream(server_peer, protocol).await?;
+            stream.write_all(&vec![42; 32768]).await?;
+            stream.flush().await?;
+            let _ = started_tx.send(());
+            continue_rx.await?;
+            stream.write_all(&vec![42; 32768]).await?;
+            stream.close().await?;
+            Ok::<_, anyhow::Error>(())
+        });
+        transfers.spawn(async move {
+            let (_, mut stream) = incoming
+                .next()
+                .await
+                .ok_or_else(|| anyhow::anyhow!("Incoming transfer closed"))?;
+            let mut bytes = Vec::new();
+            stream.read_to_end(&mut bytes).await?;
+            anyhow::ensure!(
+                bytes == vec![42; 65536],
+                "Active transfer bytes changed during revalidation"
+            );
+            Ok::<_, anyhow::Error>(())
+        });
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                tokio::select! {
+                    result = &mut started_rx => { result?; break; },
+                    _ = client.select_next_some() => {},
+                    _ = server.select_next_some() => {},
+                }
+            }
+            Ok::<_, anyhow::Error>(())
+        })
+        .await??;
+        let established = client.behaviour().nat.connections.clone();
+        client
+            .behaviour_mut()
+            .nat
+            .revalidate(Instant::now() + RECHECK_AFTER);
+        tokio::time::timeout(Duration::from_secs(45), async {
+            loop {
+                tokio::select! {
+                    event = client.select_next_some() => {
+                        if let SwarmEvent::Behaviour(ProbeClientEvent::Nat(event)) = event {
+                            if event.tested_addr == client_address {
+                                anyhow::ensure!(event.result.is_ok(), "Re-probe failed: {:?}", event.result);
+                                break;
+                            }
+                        }
+                    },
+                    _ = server.select_next_some() => {},
+                }
+            }
+            Ok::<_, anyhow::Error>(())
+        }).await??;
+        assert!(established.is_subset(&client.behaviour().nat.connections));
+        continue_tx
+            .send(())
+            .map_err(|_| anyhow::anyhow!("Active stream stopped during re-probe"))?;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                tokio::select! {
+                    result = transfers.join_next() => match result { Some(result) => result??, None => break },
+                    _ = client.select_next_some() => {},
+                    _ = server.select_next_some() => {},
+                }
+            }
+            Ok::<_, anyhow::Error>(())
+        }).await??;
         Ok(())
     }
 }
