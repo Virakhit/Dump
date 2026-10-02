@@ -4,6 +4,7 @@ use crate::{
         ConnectionState, Diagnostics, DialFailure, Reachability, ReachabilityStatus, MAX_ADDRESSES,
     },
     engine::{open_source, refresh_share, stamp, Shared},
+    holepunch::HolePunch,
     identify::Identify,
     model::*,
     reachability::{Client as NatClient, PublicAddresses},
@@ -45,6 +46,8 @@ const INACTIVITY: Duration = Duration::from_secs(30);
 
 #[derive(NetworkBehaviour)]
 struct Behaviour {
+    // Check connection admission before other handlers allocate per-connection state.
+    limits: connection_limits::Behaviour,
     streams: Streams,
     relay_streams: Streams,
     relay: relay::client::Behaviour,
@@ -52,7 +55,7 @@ struct Behaviour {
     ping: ping::Behaviour,
     identify: Identify,
     autonat: NatClient,
-    limits: connection_limits::Behaviour,
+    holepunch: HolePunch,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -229,6 +232,7 @@ impl Node {
                         .with_cache_size(0),
                 ),
                 autonat: NatClient::new(peer),
+                holepunch: HolePunch::new(peer),
                 limits: connection_limits::Behaviour::new(
                     connection_limits::ConnectionLimits::default()
                         .with_max_pending_incoming(Some(16))
@@ -391,6 +395,10 @@ impl Node {
                                     public_addresses: addresses,
                                 });
                             }
+                        },
+                        SwarmEvent::Behaviour(BehaviourEvent::Holepunch(event)) => {
+                            diagnostic_tx.send_modify(|d| { if let Some(d) = diagnostic(d, event.remote_peer_id) { d.hole_punch_succeeded = Some(event.result.is_ok()); } });
+                            // Failure leaves the authenticated circuit and current streams intact.
                         },
                         SwarmEvent::ConnectionEstablished { peer_id, connection_id, endpoint, .. } => {
                             connections.insert(connection_id, (peer_id, endpoint.is_relayed()));

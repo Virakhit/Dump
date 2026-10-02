@@ -188,6 +188,11 @@ async fn circuit_carries_join_catalog_file_and_direct_takes_over() -> Result<()>
     }
     assert_eq!(std::fs::read(destination.join(&manifest.name))?, payload);
     assert!(member.lock().await.persisted.partials.is_empty());
+    assert_eq!(
+        a.diagnostics.borrow()[&member_id.parse()?].hole_punch_succeeded,
+        Some(false),
+        "private candidates must keep the circuit fallback"
+    );
     // The relay's real public identity is not a workspace member.
     let outsider = Engine::open(&root.path().join("outsider"), Arc::new(|_| {}))?;
     let c = Node::start(outsider, false).await?;

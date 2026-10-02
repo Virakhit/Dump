@@ -43,6 +43,7 @@ pub struct PeerDiagnostics {
     /// Reported by this peer, unverified; never advertised as a reachable address.
     pub observed_address: Option<Multiaddr>,
     pub advertised_addresses: Vec<Multiaddr>,
+    pub hole_punch_succeeded: Option<bool>,
 }
 
 pub type Diagnostics = BTreeMap<PeerId, PeerDiagnostics>;

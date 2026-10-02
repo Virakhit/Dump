@@ -30,6 +30,13 @@ This records checks on the development Windows machine, not approval for a publi
 - Initial relay tests timed out because the test server had no external address to advertise in reservations; adding an explicit test-only loopback advertisement fixed that harness. The next direct-takeover test exposed the default libp2p dial condition, which prevents adding a direct connection while already connected via relay; the explicit upgrade uses `PeerCondition::Always`. Clippy then rejected one collapsible match, which was corrected. Complete checks passed after these fixes.
 - No public relay, actual NAT/hole punch or new installer was used. Relay host opt-in/resource ceilings, automatic Internet contact handling and a dedicated hostile-provider byte-corruption transfer test remain later-stage work. This stage does not change persisted identities, workspace data or v1 signed payloads.
 
+## v0.2 Stage 4 — DCUtR
+
+- Core suite: 19 passed; desktop library: ten passed. Frontend build, Rustfmt and configured Clippy passed. The existing large transfer was not repeated.
+- Three local swarms exercised the shipping DCUtR adapter: an initial circuit became a direct authenticated connection, with a successful DCUtR event. Loopback candidates are allowed only in that test; shipping candidates must be public literal IP routes tied to the expected Peer ID.
+- A production-filtered circuit test confirmed failed hole punching still carried a complete verified file and retained the relay fallback. Private/DNS/mismatched identity hole-punch routes are rejected before dialing. Negotiations are bounded to eight handler events per connection and 1024 per connected lifetime; the native behavior resets after all connections close.
+- These tests use no public service and do not prove traversal of a real NAT or firewall. No new installer was published.
+
 ## Passed
 
 - TypeScript and Vite production build.
