@@ -192,10 +192,12 @@ pub struct Invitation {
     pub workspace_id: Uuid,
     pub owner_peer_id: String,
     pub token: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contact: Option<crate::contact::Contact>,
 }
 impl Invitation {
     pub fn parse(value: &str) -> Result<Self> {
-        ensure!(value.len() <= 2048, "Invite is too long");
+        ensure!(value.len() <= 8192, "Invite is too long");
         let payload = value
             .trim()
             .strip_prefix("dump://join/")
@@ -206,6 +208,13 @@ impl Invitation {
             "Invalid invite"
         );
         invitation.owner_peer_id.parse::<libp2p::PeerId>()?;
+        if let Some(contact) = &invitation.contact {
+            contact.verify()?;
+            ensure!(
+                contact.peer_id == invitation.owner_peer_id,
+                "Contact does not belong to invitation owner"
+            );
+        }
         Ok(invitation)
     }
     pub fn url(&self) -> Result<String> {
@@ -249,6 +258,8 @@ pub struct Persisted {
     pub history: Vec<AuditEvent>,
     #[serde(default)]
     pub network: crate::relay_host::Settings,
+    #[serde(default)]
+    pub contacts: BTreeMap<String, crate::contact::Contact>,
 }
 impl Persisted {
     pub fn new() -> Result<Self> {
@@ -264,6 +275,7 @@ impl Persisted {
             partials: Vec::new(),
             history: Vec::new(),
             network: Default::default(),
+            contacts: Default::default(),
         })
     }
     pub fn key(&self) -> Result<Keypair> {

@@ -44,6 +44,33 @@ This records checks on the development Windows machine, not approval for a publi
 - The first host build exposed the derive macro's visibility requirement; the admission type now has matching crate visibility. The first quota test appended a duplicate destination suffix to an already complete reservation address; removing that test error fixed it. Complete checks passed after correction.
 - Advanced settings persist under DPAPI with opt-in disabled by default and changes applied after restart. The host has no Engine or file/disk API. Public hosting, wizard interaction, rate fairness under attack and real NAT/firewall behavior remain unverified; no new installer was published. The hosting role currently forwards circuits, not AutoNAT probes.
 
+## v0.2 Stage 6 — private contacts and automatic routing
+
+- Final core suite: 26 passed (16 unit, four connectivity, four LAN, two relay); the previous 8 GiB check remained ignored. Desktop library: 17 passed. Native signed-updater test: one passed, its optional public download check was not repeated. Publisher test: one passed. Patched stream package: one passed. Frontend production build, Rustfmt check, diff whitespace check and configured Clippy passed.
+- An isolated automatic invitation test supplied a signed circuit locator, with no mDNS and no explicit owner dial by the joining node. It reached the owner, obtained manual approval, discovered a signed manifest and received the exact 2 MiB + 17 byte payload through the bounded host role. A third authenticated nonmember received no contact records. Loopback contacts were injected only into the private unit harness; public invitation parsing and the shipping start entry point reject them.
+- Signed-record checks cover route/key/identity modification, expiry, private/DNS routes, invitation owner pinning, stale sequence rejection and conflicting equal sequences. Creating a fresh Internet invite renews its contact for the full token lifetime. Restoring a serialized legacy state with no new fields retained the same identity and verified workspace roster, with assistance off and an empty contact cache.
+- A deliberately malicious approved provider authenticated with its real key and returned a valid signed manifest, incorrect raw bytes of the expected size and a framed `Done`. The actual receiver failed final SHA-256 verification; no destination, partial file or recorded partial remained. This tests corrupt application data from an endpoint; it is not a packet-capture test of altering encrypted relay traffic.
+- Routing checks cover LAN before public direct before circuits, QUIC/TCP alternatives for one configured relay, and retaining active relay diagnostics when expired entries are evicted at the 256-peer ceiling. Contact requests authorize every page; v1 control/file payloads and signature domains remain unchanged. Host listener failures now report a bounded generic error without stopping LAN/file sharing.
+- Intermediate builds caught a moved watch receiver, missing multiaddress type annotations in a test and a Clippy request to use `?` in eviction. These were corrected and the affected full checks rerun. The UI keeps multiline address editing intact and trims/removes blank lines only when saving.
+- No new installer or release was built/published for this milestone. Actual different-network NAT/CGNAT/firewall behavior, native UI interaction and packet capture remain unverified. AutoNAT's completed candidates are conservatively withdrawn on expiry and wait for an all-connection reset before re-probing; public listener hints and live relay locators remain separate contact routing options. All tests below use local services only.
+
+### Requested twelve-case regression matrix
+
+| Case | Executed evidence |
+|---|---|
+| 1. LAN still connects | `lan_mdns_still_finds_invited_owner_without_explicit_addresses`; existing LAN file/revocation tests |
+| 2. Explicit Internet-style addresses | `explicit_direct_addresses_identify_and_nonmember_denials`, `authenticated_tcp_route_supports_the_same_workspace_protocol`; literal loopback simulation, not a public Internet route |
+| 3. Existing protocols over relay | `circuit_carries_join_catalog_file_and_direct_takes_over`; automatic invitation/circuit file test |
+| 4. Relay cannot bypass membership | Real relay identity fails workspace authorization; circuit outsider is denied |
+| 5. Tampered bytes rejected | `authorized_provider_wrong_bytes_fail_final_hash_and_leave_no_partial` |
+| 6. Wrong Peer ID | `mismatched_transport_identity_never_connects`; suffix/circuit/contact key binding checks |
+| 7. Unauthorized catalog | Explicit direct and circuit outsider catalog requests denied |
+| 8. Unauthorized file | Explicit direct and circuit outsider file-header requests denied |
+| 9. Relay loss cleanup | `relay_loss_during_transfer_never_commits_a_partial_file` after partial bytes exist |
+| 10. Direct preference | Direct takeover beside a circuit remains usable after stopping the relay; separate route-order check |
+| 11. DCUtR upgrade | `dcutr_negotiates_a_direct_quic_upgrade_through_a_local_relay`; failed-upgrade circuit fallback |
+| 12. Relay limits | `shared_bandwidth_and_connection_rate_are_bounded`, `host_rejects_excess_reservations_and_stops_over_budget_payload` |
+
 ## Passed
 
 - TypeScript and Vite production build.

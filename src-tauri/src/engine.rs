@@ -298,17 +298,105 @@ impl Engine {
             expires_at: now() + 86400,
             approved_peer: None,
         });
+        let contact = next
+            .contacts
+            .get(&self.peer())
+            .filter(|c| c.verify().is_ok() && !c.addresses.is_empty())
+            .map(|c| {
+                crate::contact::Contact::issue(
+                    &self.key,
+                    c.sequence
+                        .checked_add(1)
+                        .context("Contact sequence exhausted")?,
+                    c.addresses.clone(),
+                )
+            })
+            .transpose()?;
+        if let Some(contact) = &contact {
+            next.contacts.insert(self.peer(), contact.clone());
+        }
         self.persist(next)?;
         let url = Invitation {
             version: VERSION,
             workspace_id: snapshot.workspace_id,
             owner_peer_id: self.peer(),
             token,
+            contact,
         }
         .url()?;
         self.invite_url = Some(url.clone());
         self.emit();
         Ok(url)
+    }
+    pub(crate) fn update_contact(&mut self, addresses: Vec<String>) -> Result<()> {
+        let peer = self.peer();
+        if self
+            .persisted
+            .contacts
+            .get(&peer)
+            .is_some_and(|c| c.addresses == addresses && c.expires_at > now() + 3600)
+        {
+            return Ok(());
+        }
+        let sequence = self.persisted.contacts.get(&peer).map_or(Ok(1), |c| {
+            c.sequence
+                .checked_add(1)
+                .context("Contact sequence exhausted")
+        })?;
+        let contact = crate::contact::Contact::issue(&self.key, sequence, addresses)?;
+        let mut next = self.persisted.clone();
+        next.contacts
+            .retain(|id, c| *id == peer || c.expires_at > now());
+        ensure!(
+            next.contacts.len() < 256 || next.contacts.contains_key(&peer),
+            "Contact cache full"
+        );
+        next.contacts.insert(peer, contact);
+        self.persist(next)
+    }
+    pub(crate) fn cache_contacts(
+        &mut self,
+        snapshot: &Snapshot,
+        contacts: Vec<crate::contact::Contact>,
+    ) -> Result<()> {
+        ensure!(
+            contacts.len() <= 8 && self.persisted.active == Some(snapshot.workspace_id),
+            "Invalid contact page"
+        );
+        let mut next = self.persisted.clone();
+        let own = self.peer();
+        next.contacts
+            .retain(|id, c| *id == own || c.expires_at > now());
+        let mut changed = false;
+        for contact in contacts {
+            contact.verify()?;
+            ensure!(
+                snapshot.contains(&contact.peer_id),
+                "Contact is not a member"
+            );
+            if contact.peer_id == own {
+                continue;
+            }
+            if let Some(old) = next.contacts.get(&contact.peer_id) {
+                if contact.sequence < old.sequence {
+                    continue;
+                }
+                if contact.sequence == old.sequence {
+                    ensure!(old == &contact, "Conflicting contact sequence");
+                    continue;
+                }
+            }
+            ensure!(
+                next.contacts.len() < 256 || next.contacts.contains_key(&contact.peer_id),
+                "Contact cache full"
+            );
+            next.contacts.insert(contact.peer_id.clone(), contact);
+            changed = true;
+        }
+        if changed {
+            self.persist(next)?;
+        }
+        Ok(())
     }
     pub fn join(&mut self, value: &str) -> Result<()> {
         let invite = Invitation::parse(value)?;

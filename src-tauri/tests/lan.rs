@@ -269,6 +269,7 @@ async fn stale_refresh_cannot_cross_workspaces_or_undo_unshare() -> Result<()> {
         workspace_id: private_id,
         owner_peer_id: attacker.public().to_peer_id().to_string(),
         token: random_secret(),
+        contact: None,
     };
     assert!(shared.lock().await.join(&forged.url()?).is_err());
     shared.lock().await.create_workspace("Public".into())?;

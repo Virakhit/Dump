@@ -52,7 +52,7 @@ Sharing does not duplicate the original file. Files being hashed or served are t
 - Protocol safety ceilings: 128 members per workspace, 10,000 advertised files, 100 queued/active transfers, 32 pending join requests, and 128 live invite records.
 - The initial product target is small groups of up to ten devices. Protocol ceilings are defensive bounds, not tested capacity claims.
 - LAN clients must be able to reach each other. Wi-Fi guest/client isolation or blocked UDP/multicast may prevent discovery. Use the network's approved firewall configuration; Dump does not disable protection or create port-forwarding rules.
-- Internet discovery, NAT traversal, relays, resume, folders, previews, background update checks, and telemetry are not implemented. App updates use GitHub only after you request a check.
+- In the published 0.1.1 installer, Internet discovery, NAT traversal and relays are unavailable. Resume, folders, previews, background update checks and telemetry are also outside this milestone. App updates use GitHub only after you request a check.
 
 ## Troubleshooting
 
@@ -71,7 +71,11 @@ Check the network's approved firewall configuration if discovery or connections 
 
 Building from source is optional. See the [development guide](docs/DEVELOPMENT.md) for prerequisites, development commands, installer builds, and tests.
 
-The v0.2 Internet milestone is under development. Stages 1–5 add Identify, bounded explicit dialing, AutoNAT v2, authenticated TCP fallback and an explicitly configured encrypted circuit relay client to the Rust core. Confirmed public address evidence expires; all routes still require workspace authorization. New streams prefer an established direct route while existing circuit transfers can finish. LAN invitations and mDNS remain available without Internet access. This is not yet an end-user cross-network release: DCUtR and opt-in relay hosting/settings are locally tested; automatic Internet invites are pending in the [staged plan](docs/PLAN.md). The installer linked above remains the published LAN-only 0.1.1 build.
+The v0.2 Internet milestone is implemented in source and locally tested: Identify, bounded direct dialing, AutoNAT v2, authenticated TCP fallback, end-peer encrypted relay circuits, DCUtR, opt-in forwarding with resource ceilings, signed invitation contacts and authorized contact exchange. Known LAN/direct routes take priority; direct upgrades preserve active relay transfers. Legacy identities/workspaces/invites remain usable. There is no default or mandatory Dump relay.
+
+To test different-network invitations, both devices need this source build and the owner needs a reachable direct route or a configured trusted relay. Open **Network settings > Advanced connectivity**, add a reachable relay locator, restart Dump, then create the invitation after its reservation is ready. The recipient opens it and follows the usual fingerprint/approval/share/receive flow. Raw addresses stay in advanced settings. For community hosting, see the [opt-in role and setup steps](docs/PROTOCOL.md#opt-in-hosting-stage-5).
+
+The installer linked above remains the LAN-only 0.1.1 release. No new Internet installer has been built or published. Local simulated networks cover all twelve requested regression cases, including real protocol exchanges, but do not establish success through actual NAT/CGNAT/firewalls. See the [verification matrix](docs/VERIFICATION.md) and [remaining acceptance gates](docs/PLAN.md). Before packaging this source, bump its app version as described in the development guide.
 
 ## Documentation
 

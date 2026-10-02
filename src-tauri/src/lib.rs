@@ -1,4 +1,5 @@
 pub mod connectivity;
+pub mod contact;
 #[cfg(feature = "desktop")]
 mod desktop;
 pub mod engine;

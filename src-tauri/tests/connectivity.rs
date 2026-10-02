@@ -151,7 +151,8 @@ async fn mismatched_transport_identity_never_connects() -> Result<()> {
                     version: 1,
                     workspace_id: uuid::Uuid::new_v4(),
                     owner_peer_id: wrong.to_string(),
-                    token: "invalid".into()
+                    token: "invalid".into(),
+                    contact: None,
                 },
                 name: "Client".into(),
             }

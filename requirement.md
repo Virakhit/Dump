@@ -510,7 +510,7 @@ Rust Core
 
 ### Later Versions
 
-The requested v0.2 milestone now includes Internet direct connectivity, NAT traversal and encrypted community relay fallback, delivered in the small stages recorded in `docs/PLAN.md`. Public/private address observations must be verified before advertisement; invitations will carry signed contact locators through a trusted channel rather than public workspace discovery. No mandatory Dump backend is introduced, and existing identities, membership signatures and LAN operation remain compatible. This is a requested target, not a claim that every stage is implemented.
+The requested v0.2 milestone now includes Internet direct connectivity, NAT traversal and encrypted community relay fallback, delivered in the small stages recorded in `docs/PLAN.md`. Public/private address observations must be verified before advertisement; invitations now carry optional signed contact locators through a trusted channel rather than public workspace discovery. No mandatory Dump backend is introduced, and existing identities, membership signatures and LAN operation remain compatible. The six source stages are implemented and locally tested. The published 0.1.1 installer remains LAN-only; real cross-network/NAT/firewall and distribution acceptance gates are still open. Contacts use public listener hints and live circuit locators without promoting unverified observed addresses to confirmed public advertisements.
 
 Earlier possible progression (superseded for the v0.2 connectivity milestone):
 

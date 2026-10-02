@@ -44,6 +44,7 @@ pub struct PeerDiagnostics {
     pub observed_address: Option<Multiaddr>,
     pub advertised_addresses: Vec<Multiaddr>,
     pub hole_punch_succeeded: Option<bool>,
+    pub supports_contacts: bool,
 }
 
 pub type Diagnostics = BTreeMap<PeerId, PeerDiagnostics>;
@@ -53,7 +54,11 @@ pub(crate) fn diagnostic(
     peer: PeerId,
 ) -> Option<&mut PeerDiagnostics> {
     if diagnostics.len() >= MAX_PEERS && !diagnostics.contains_key(&peer) {
-        return None;
+        let expired = diagnostics
+            .iter()
+            .find(|(_, d)| d.state == ConnectionState::Offline)
+            .map(|(p, _)| *p)?;
+        diagnostics.remove(&expired);
     }
     Some(diagnostics.entry(peer).or_default())
 }
@@ -145,6 +150,9 @@ pub fn public_address(address: &Multiaddr) -> bool {
 pub(crate) struct AddressBook(BTreeMap<PeerId, Vec<Multiaddr>>);
 
 impl AddressBook {
+    pub fn routes(&self, peer: &PeerId) -> Vec<Multiaddr> {
+        self.0.get(peer).cloned().unwrap_or_default()
+    }
     pub fn contains(&self, peer: &PeerId) -> bool {
         self.0.contains_key(peer)
     }
@@ -214,6 +222,14 @@ mod tests {
         assert!(book
             .remember(peer(), "/ip4/127.0.0.1/udp/9000/quic-v1".parse()?)
             .is_err());
+        let mut diagnostics = Diagnostics::new();
+        diagnostic(&mut diagnostics, id).unwrap().state = ConnectionState::Relay;
+        for _ in 1..MAX_PEERS {
+            diagnostic(&mut diagnostics, peer()).unwrap();
+        }
+        assert!(diagnostic(&mut diagnostics, peer()).is_some());
+        assert_eq!(diagnostics.len(), MAX_PEERS);
+        assert_eq!(diagnostics[&id].state, ConnectionState::Relay);
         Ok(())
     }
 

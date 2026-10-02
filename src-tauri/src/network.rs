@@ -41,6 +41,7 @@ use uuid::Uuid;
 
 const CONTROL: StreamProtocol = StreamProtocol::new("/dump/control/1");
 const FILE: StreamProtocol = StreamProtocol::new("/dump/file/1");
+const CONTACT: StreamProtocol = StreamProtocol::new("/dump/contact/1");
 const PREAUTH_TIMEOUT: Duration = Duration::from_secs(5);
 const INACTIVITY: Duration = Duration::from_secs(30);
 
@@ -91,6 +92,19 @@ pub enum Response {
     },
     Done,
     Denied,
+}
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ContactRequest {
+    snapshot: Snapshot,
+    contact: Option<crate::contact::Contact>,
+    offset: u32,
+}
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ContactResponse {
+    contacts: Vec<crate::contact::Contact>,
+    total: u32,
 }
 
 pub async fn write_frame<S: AsyncWrite + Unpin, T: Serialize>(
@@ -182,6 +196,24 @@ fn connection_state(
     }
 }
 
+fn preferred_routes(peer: PeerId, addresses: Vec<Multiaddr>) -> Vec<Multiaddr> {
+    let mut routes: Vec<_> = addresses
+        .into_iter()
+        .filter_map(|a| peer_address(peer, a).ok())
+        .collect();
+    routes.sort_by_key(|a| {
+        (
+            is_relayed(a),
+            public_address(a),
+            !a.iter().any(|p| p == libp2p::multiaddr::Protocol::QuicV1),
+            a.to_string(),
+        )
+    });
+    routes.dedup();
+    routes.truncate(MAX_ADDRESSES);
+    routes
+}
+
 #[derive(Clone)]
 pub struct Node {
     pub shared: Shared,
@@ -197,6 +229,10 @@ pub struct Node {
 }
 impl Node {
     pub async fn start(shared: Shared, discovery: bool) -> Result<Self> {
+        Self::start_inner(shared, discovery, false).await
+    }
+    async fn start_inner(shared: Shared, discovery: bool, allow_loopback: bool) -> Result<Self> {
+        let allow_loopback = allow_loopback && cfg!(test);
         let key = shared.lock().await.key.clone();
         let peer = key.public().to_peer_id();
         let mdns = if discovery {
@@ -266,6 +302,8 @@ impl Node {
         let mut incoming =
             futures::stream::select(control.accept(CONTROL)?, relay_control.accept(CONTROL)?);
         let mut files = futures::stream::select(control.accept(FILE)?, relay_control.accept(FILE)?);
+        let mut contacts =
+            futures::stream::select(control.accept(CONTACT)?, relay_control.accept(CONTACT)?);
         let (dial, mut dials) = mpsc::channel(128);
         let (address_tx, addresses) = watch::channel(Vec::new());
         let (diagnostic_tx, diagnostics) = watch::channel(Diagnostics::new());
@@ -273,11 +311,15 @@ impl Node {
         let (relay_tx, relay_addresses) = watch::channel(Vec::new());
         let limits = Arc::new(Limits::new());
         let shutdown = CancellationToken::new();
+        let (host_error, mut host_errors) = mpsc::channel(1);
         {
             let mut e = shared.lock().await;
-            if let Err(err) =
-                crate::relay_host::start(e.key.clone(), &e.persisted.network, shutdown.clone())
-            {
+            if let Err(err) = crate::relay_host::start(
+                e.key.clone(),
+                &e.persisted.network,
+                shutdown.clone(),
+                host_error,
+            ) {
                 e.error(format!("Network assistance could not start: {err}"));
             }
         }
@@ -305,9 +347,11 @@ impl Node {
             let mut public = PublicAddresses::default();
             let mut reservations = BTreeMap::new();
             let mut connections = BTreeMap::new();
+            let mut attempts: BTreeMap<PeerId, (Instant, usize)> = BTreeMap::new();
             loop {
                 tokio::select! {
                     _ = shutdown.cancelled() => break,
+                    Some(message) = host_errors.recv() => shared.lock().await.error(message),
                     Some(Dial { peer, address, reply, reserve }) = dials.recv() => {
                         let result = (|| {
                             discovered.remember(peer, address.clone())?;
@@ -344,6 +388,12 @@ impl Node {
                             tokio::spawn(async move { let _permit = permit; let _ = serve_file(state, limits, peer, stream).await; });
                         }
                     },
+                    Some((peer, stream)) = contacts.next() => {
+                        if let Ok(permit) = incoming_slots.clone().try_acquire_owned() {
+                            let state = shared.clone();
+                            tokio::spawn(async move { let _permit = permit; let _ = serve_contacts(state, peer, stream).await; });
+                        }
+                    },
                     event = swarm.select_next_some() => match event {
                         SwarmEvent::NewListenAddr { address, .. } => {
                             if is_relayed(&address) {
@@ -374,6 +424,7 @@ impl Node {
                                 diagnostic_tx.send_modify(|d| {
                                     if let Some(d) = diagnostic(d, peer_id) {
                                         d.identified = true;
+                                        d.supports_contacts = info.protocols.contains(&CONTACT);
                                         d.observed_address = observed;
                                         d.advertised_addresses = info.listen_addrs.iter().take(MAX_ADDRESSES).cloned().collect();
                                     }
@@ -443,6 +494,7 @@ impl Node {
                                     d.identified = false;
                                     d.observed_address = None;
                                     d.advertised_addresses.clear();
+                                    d.supports_contacts = false;
                                 }
                             });
                             let mut e = shared.lock().await; e.online.remove(&peer_id.to_string()); e.remote.retain(|_,m| m.owner_peer_id != peer_id.to_string());
@@ -450,7 +502,9 @@ impl Node {
                             e.emit();
                         },
                         SwarmEvent::ListenerError { listener_id, .. } => {
-                            let message = if reservations.values().any(|id| *id == listener_id) { "Configured relay is unavailable or has no capacity; direct and LAN routes can still work" } else { "Local listener failed; restart Dump and check Windows firewall" };
+                            let configured_relay = reservations.values().any(|id| *id == listener_id);
+                            if configured_relay { swarm.remove_listener(listener_id); reservations.retain(|_, id| *id != listener_id); }
+                            let message = if configured_relay { "Configured relay is unavailable or has no capacity; direct and LAN routes can still work" } else { "Local listener failed; restart Dump and check Windows firewall" };
                             shared.lock().await.error(message);
                         },
                         _ => {},
@@ -463,15 +517,43 @@ impl Node {
                             reachability_tx.send_replace(Reachability { status: if addresses.is_empty() { ReachabilityStatus::Unknown } else { ReachabilityStatus::Public }, public_addresses: addresses });
                         }
                         let mut e = shared.lock().await;
+                        let mut own_addresses: Vec<_> = reachability_tx.borrow().public_addresses.iter().chain(listeners.iter()).filter(|a| !is_relayed(a) && public_address(a)).filter_map(|a| peer_address(peer, a.clone()).ok()).map(|a| a.to_string()).collect();
+                        own_addresses.sort(); own_addresses.dedup(); own_addresses.truncate(MAX_ADDRESSES - 3);
+                        own_addresses.extend(relay_tx.borrow().iter().filter(|a| public_address(a)).filter_map(|a| peer_address(peer, a.clone()).ok()).map(|a| a.to_string()));
+                        own_addresses.sort(); own_addresses.dedup(); own_addresses.truncate(MAX_ADDRESSES);
+                        if let Err(err) = e.update_contact(own_addresses) { e.error(format!("Cannot save contact routes: {err}")); }
                         e.online.retain(|_,seen| now().saturating_sub(*seen) < 15);
                         let active_peers: BTreeSet<_> = e.online.keys().cloned().collect();
                         e.remote.retain(|_,m| active_peers.contains(&m.owner_peer_id));
                         e.pending.retain(|_,p| now().saturating_sub(p.requested_at) < 86400);
                         let joining = e.persisted.joining.clone();
                         let targets = e.active_snapshot().ok().filter(|s| s.contains(&e.peer())).map(|s| s.members.into_iter().filter_map(|m| m.peer_id.parse::<PeerId>().ok()).filter(|p| *p != peer).collect::<Vec<_>>()).unwrap_or_default();
-                        e.network_status = if !e.online.is_empty() { if e.online.keys().filter_map(|p| p.parse().ok()).any(|p| connection_state(&connections, p) == ConnectionState::Direct) { "Connected directly" } else { "Connected via relay" } } else if joining.is_some() { "Connecting…" } else if listeners.is_empty() { "Offline" } else if discovery { "LAN discovery is running" } else { "Listening for direct connections" }.into();
+                        let mut desired = targets.clone();
+                        if let Some(invite) = &joining { if let Ok(id) = invite.owner_peer_id.parse() { desired.push(id); } }
+                        desired.sort(); desired.dedup();
+                        attempts.retain(|p, _| desired.contains(p));
+                        for target in &desired {
+                            let mut routes = discovered.routes(target);
+                            if let Some(contact) = e.persisted.contacts.get(&target.to_string()) { if let Ok(contact_routes) = contact.routes_with_policy(allow_loopback) { routes.extend(contact_routes); } }
+                            if let Some(contact) = joining.as_ref().and_then(|i| i.contact.as_ref()).filter(|c| c.peer_id == target.to_string()) { if let Ok(contact_routes) = contact.routes_with_policy(allow_loopback) { routes.extend(contact_routes); } }
+                            let routes = preferred_routes(*target, routes);
+                            if routes.is_empty() { continue; }
+                            let state = connection_state(&connections, *target);
+                            let available: Vec<_> = routes.into_iter().filter(|a| state != ConnectionState::Relay || !is_relayed(a)).collect();
+                            if state == ConnectionState::Direct || available.is_empty() { continue; }
+                            if let Some((at, _)) = attempts.get(target) { if at.elapsed() < Duration::from_secs(if state == ConnectionState::Relay { 30 } else { 10 }) { continue; } }
+                            let index = attempts.get(target).map_or(0, |(_, index)| *index) % available.len();
+                            let address = available[index].clone();
+                            {
+                                let condition = if state == ConnectionState::Relay { PeerCondition::Always } else { PeerCondition::DisconnectedAndNotDialing };
+                                let _ = swarm.dial(DialOpts::peer_id(*target).condition(condition).addresses(vec![address.with(libp2p::multiaddr::Protocol::P2p(*target))]).build());
+                                diagnostic_tx.send_modify(|d| { if let Some(d) = diagnostic(d, *target) { if state == ConnectionState::Offline { d.state = ConnectionState::Connecting; } } });
+                            }
+                            attempts.insert(*target, (Instant::now(), index + 1));
+                        }
+                        e.network_status = if !e.online.is_empty() { if e.online.keys().filter_map(|p| p.parse().ok()).any(|p| connection_state(&connections, p) == ConnectionState::Direct) { "Connected directly" } else { "Connected via relay" } } else if joining.is_some() || desired.iter().any(|p| diagnostic_tx.borrow().get(p).is_some_and(|d| d.state == ConnectionState::Connecting)) { "Connecting…" } else if listeners.is_empty() || !desired.is_empty() { "Offline" } else if discovery { "LAN discovery is running" } else { "Offline" }.into();
                         e.emit(); drop(e);
-                        for target in targets.into_iter().filter(|p| discovered.contains(p)) {
+                        for target in targets.into_iter().filter(|p| connection_state(&connections, *p) != ConnectionState::Offline) {
                             let mut ongoing = in_flight.lock().await;
                             if ongoing.insert(target) {
                                 let node = poll_node.clone(); let ongoing = in_flight.clone();
@@ -482,7 +564,7 @@ impl Node {
                             if now() >= last_join + 4 {
                                 last_join = now();
                                 if let Ok(target) = invite.owner_peer_id.parse::<PeerId>() {
-                                    if discovered.contains(&target) {
+                                    if connection_state(&connections, target) != ConnectionState::Offline {
                                         let mut ongoing = in_flight.lock().await;
                                         if ongoing.insert(target) { let node = poll_node.clone(); let ongoing = in_flight.clone(); tokio::spawn(async move { let _ = node.poll_join(invite).await; ongoing.lock().await.remove(&target); }); }
                                     }
@@ -504,6 +586,23 @@ impl Node {
             reachability_tx.send_replace(Reachability::default());
             relay_tx.send_replace(Vec::new());
         });
+        let relay_node = node.clone();
+        let configured = node.shared.lock().await.persisted.network.relays.clone();
+        if !configured.is_empty() {
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(Duration::from_secs(15));
+                let mut rotation = 0;
+                loop {
+                    tokio::select! { _ = relay_node.shutdown.cancelled() => break, _ = tick.tick() => {} }
+                    for (peer, address) in crate::relay_host::relay_choices(&configured, rotation) {
+                        if relay_node.reserve_relay(peer, address).await.is_err() {
+                            relay_node.shared.lock().await.error("Configured relay could not be reserved. Check Advanced connectivity; LAN and direct routes remain available.");
+                        }
+                    }
+                    rotation = (rotation + 1) % configured.len();
+                }
+            });
+        }
         let refresh_shared = node.shared.clone();
         let refresh_shutdown = node.shutdown.clone();
         tokio::spawn(async move {
@@ -739,6 +838,69 @@ impl Node {
         }
         e.online.insert(peer.to_string(), now());
         e.emit();
+        drop(e);
+        if self
+            .diagnostics
+            .borrow()
+            .get(&peer)
+            .is_some_and(|d| d.supports_contacts)
+        {
+            self.exchange_contacts(peer).await?;
+        }
+        Ok(())
+    }
+    async fn exchange_contacts(&self, peer: PeerId) -> Result<()> {
+        let (snapshot, contact) = {
+            let e = self.shared.lock().await;
+            (
+                e.active_snapshot()?,
+                e.persisted
+                    .contacts
+                    .get(&e.peer())
+                    .filter(|c| c.verify().is_ok())
+                    .cloned(),
+            )
+        };
+        let mut offset = 0;
+        let mut expected = None;
+        loop {
+            let mut control = self.stream_control(peer);
+            let mut stream =
+                tokio::time::timeout(PREAUTH_TIMEOUT, control.open_stream(peer, CONTACT)).await??;
+            write_frame(
+                &mut stream,
+                &ContactRequest {
+                    snapshot: snapshot.clone(),
+                    contact: if offset == 0 { contact.clone() } else { None },
+                    offset,
+                },
+            )
+            .await?;
+            let response: ContactResponse = read_frame(&mut stream).await?;
+            ensure!(
+                response.total <= MAX_MEMBERS as u32
+                    && response.contacts.len() <= 8
+                    && offset <= response.total
+                    && response.contacts.len() as u32 <= response.total - offset
+                    && (offset == response.total || !response.contacts.is_empty()),
+                "Invalid contact page"
+            );
+            ensure!(
+                expected.is_none_or(|total| total == response.total),
+                "Contact list changed; retry"
+            );
+            expected = Some(response.total);
+            offset += response.contacts.len() as u32;
+            {
+                let mut e = self.shared.lock().await;
+                let current = e.authorize(&peer.to_string(), &snapshot)?;
+                e.cache_contacts(&current, response.contacts)?;
+            }
+            if offset == response.total {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
         Ok(())
     }
     pub async fn receive(&self, file_id: Uuid, directory: PathBuf) -> Result<Uuid> {
@@ -933,6 +1095,43 @@ pub async fn serve_control(shared: Shared, peer: PeerId, mut stream: Stream) -> 
     stream.close().await?;
     Ok(())
 }
+async fn serve_contacts(shared: Shared, peer: PeerId, mut stream: Stream) -> Result<()> {
+    shared.lock().await.admit_request(&peer.to_string())?;
+    let request: ContactRequest = read_frame(&mut stream).await?;
+    let response = {
+        let mut e = shared.lock().await;
+        let snapshot = e.authorize(&peer.to_string(), &request.snapshot)?;
+        ensure!(
+            request.offset <= MAX_MEMBERS as u32,
+            "Invalid contact offset"
+        );
+        if let Some(contact) = request.contact {
+            ensure!(
+                contact.peer_id == peer.to_string(),
+                "Contact is not the authenticated sender"
+            );
+            e.cache_contacts(&snapshot, vec![contact])?;
+        }
+        let all: Vec<_> = e
+            .persisted
+            .contacts
+            .values()
+            .filter(|c| snapshot.contains(&c.peer_id) && c.verify().is_ok())
+            .cloned()
+            .collect();
+        ContactResponse {
+            total: all.len() as u32,
+            contacts: all
+                .into_iter()
+                .skip(request.offset as usize)
+                .take(8)
+                .collect(),
+        }
+    };
+    write_frame(&mut stream, &response).await?;
+    stream.close().await?;
+    Ok(())
+}
 pub async fn handle_control(shared: Shared, peer: PeerId, request: Request) -> Result<Response> {
     let mut e = shared.lock().await;
     match request {
@@ -1112,4 +1311,294 @@ async fn serve_file(
         }
     }
     Ok(())
+}
+
+#[cfg(all(test, windows))]
+mod internet_tests {
+    use super::*;
+    use crate::{
+        contact::Contact,
+        engine::{share_paths, Engine},
+    };
+    use libp2p::swarm::Swarm;
+    async fn wait(shared: &Shared, predicate: impl Fn(&crate::engine::View) -> bool) -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(25), async {
+            loop {
+                if predicate(&shared.lock().await.view()) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await?;
+        Ok(())
+    }
+    async fn address<B: NetworkBehaviour>(swarm: &mut Swarm<B>) -> Result<Multiaddr> {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let SwarmEvent::NewListenAddr { address, .. } = swarm.select_next_some().await {
+                    break address;
+                }
+            }
+        })
+        .await
+        .map_err(Into::into)
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn invite_locator_automatically_joins_and_transfers_and_contacts_stay_private(
+    ) -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let owner = Engine::open(&root.path().join("owner"), Arc::new(|_| {}))?;
+        let member = Engine::open(&root.path().join("member"), Arc::new(|_| {}))?;
+        owner.lock().await.create_workspace("Internet".into())?;
+        let mut invite = Invitation::parse(&owner.lock().await.create_invite()?)?;
+        let relay_key = libp2p::identity::Keypair::generate_ed25519();
+        let relay_peer = relay_key.public().to_peer_id();
+        let mut relay = crate::relay_host::swarm(relay_key, crate::relay_host::config())?;
+        relay.listen_on("/ip4/127.0.0.1/udp/0/quic-v1".parse()?)?;
+        let relay_address = address(&mut relay).await?;
+        relay.add_external_address(relay_address.clone());
+        let relay_stop = CancellationToken::new();
+        let stop = relay_stop.clone();
+        let host = tokio::spawn(async move {
+            loop {
+                tokio::select! { _ = stop.cancelled() => break, _ = relay.select_next_some() => {} }
+            }
+        });
+        let a = Node::start(owner.clone(), false).await?;
+        a.reserve_relay(relay_peer, relay_address).await?;
+        let mut addresses = a.relay_addresses.clone();
+        let circuit = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(address) = addresses.borrow().first().cloned() {
+                    break Ok::<_, anyhow::Error>(address);
+                }
+                addresses.changed().await?;
+            }
+        })
+        .await??;
+        // Simulated relay address is injected only into this private unit harness.
+        // Public invitation parsing and shipping Node::start always reject loopback contacts.
+        invite.contact = Some(Contact::issue_routes(
+            &owner.lock().await.key,
+            1,
+            vec![circuit.to_string()],
+            true,
+        )?);
+        {
+            let mut e = member.lock().await;
+            let mut next = e.persisted.clone();
+            next.joining = Some(invite);
+            e.persist(next)?;
+        }
+        let b = Node::start_inner(member.clone(), false, true).await?;
+        let member_peer = member.lock().await.peer();
+        wait(&owner, |v| {
+            v.pending.iter().any(|p| p.peer_id == member_peer)
+        })
+        .await?;
+        owner.lock().await.approve(&member_peer)?;
+        wait(&member, |v| v.active.is_some() && !v.joining).await?;
+        let payload = vec![23; 2 * BLOCK + 17];
+        let source = root.path().join("via-invite.bin");
+        tokio::fs::write(&source, &payload).await?;
+        share_paths(owner.clone(), vec![source]).await?;
+        wait(&member, |v| v.files.iter().any(|f| !f.mine)).await?;
+        let file = member.lock().await.remote.values().next().unwrap().file_id;
+        let output = root.path().join("output");
+        tokio::fs::create_dir(&output).await?;
+        let id = b.receive(file, output.clone()).await?;
+        wait(&member, |v| {
+            v.transfers
+                .iter()
+                .any(|t| t.id == id && t.status == "Completed")
+        })
+        .await?;
+        assert_eq!(
+            tokio::fs::read(output.join("via-invite.bin")).await?,
+            payload
+        );
+        let outsider = Engine::open(&root.path().join("outsider"), Arc::new(|_| {}))?;
+        let c = Node::start(outsider, false).await?;
+        let owner_peer = owner.lock().await.key.public().to_peer_id();
+        let route = a.relay_addresses.borrow()[0].clone();
+        c.connect(owner_peer, route).await?;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while c
+                .diagnostics
+                .borrow()
+                .get(&owner_peer)
+                .is_none_or(|d| d.state != ConnectionState::Relay)
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await?;
+        let mut control = c.stream_control(owner_peer);
+        let mut stream = control.open_stream(owner_peer, CONTACT).await?;
+        write_frame(
+            &mut stream,
+            &ContactRequest {
+                snapshot: owner.lock().await.active_snapshot()?,
+                contact: None,
+                offset: 0,
+            },
+        )
+        .await?;
+        assert!(
+            read_frame::<_, ContactResponse>(&mut stream).await.is_err(),
+            "Nonmember must never receive contacts"
+        );
+        a.shutdown.cancel();
+        b.shutdown.cancel();
+        c.shutdown.cancel();
+        relay_stop.cancel();
+        host.await?;
+        Ok(())
+    }
+
+    #[derive(NetworkBehaviour)]
+    struct BadProvider {
+        streams: libp2p_stream::Behaviour,
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn authorized_provider_wrong_bytes_fail_final_hash_and_leave_no_partial() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let owner = Engine::open(&root.path().join("owner"), Arc::new(|_| {}))?;
+        let member = Engine::open(&root.path().join("member"), Arc::new(|_| {}))?;
+        owner.lock().await.create_workspace("Integrity".into())?;
+        let invitation = Invitation::parse(&owner.lock().await.create_invite()?)?;
+        let member_peer = member.lock().await.key.public().to_peer_id();
+        assert!(matches!(
+            handle_control(
+                owner.clone(),
+                member_peer,
+                Request::Join {
+                    invitation,
+                    name: "Member".into()
+                }
+            )
+            .await?,
+            Response::Waiting
+        ));
+        owner.lock().await.approve(&member_peer.to_string())?;
+        let workspace = {
+            let e = owner.lock().await;
+            e.persisted.workspaces[&e.persisted.active.unwrap()].clone()
+        };
+        {
+            let mut e = member.lock().await;
+            let mut next = e.persisted.clone();
+            next.active = Some(workspace.snapshot.workspace_id);
+            next.workspaces
+                .insert(workspace.snapshot.workspace_id, workspace);
+            e.persist(next)?;
+        }
+        let source = root.path().join("tampered.bin");
+        tokio::fs::write(&source, b"expected bytes").await?;
+        share_paths(owner.clone(), vec![source]).await?;
+        let manifest = owner
+            .lock()
+            .await
+            .persisted
+            .shares
+            .values()
+            .next()
+            .unwrap()
+            .manifest
+            .clone();
+        let key = owner.lock().await.key.clone();
+        let owner_peer = key.public().to_peer_id();
+        let mut provider = SwarmBuilder::with_existing_identity(key)
+            .with_tokio()
+            .with_quic()
+            .with_behaviour(|_| BadProvider {
+                streams: libp2p_stream::Behaviour::new(),
+            })?
+            .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
+            .build();
+        provider.listen_on("/ip4/127.0.0.1/udp/0/quic-v1".parse()?)?;
+        let provider_address = address(&mut provider).await?;
+        let mut files = provider.behaviour().streams.new_control().accept(FILE)?;
+        let served_manifest = manifest.clone();
+        let stop = CancellationToken::new();
+        let task_stop = stop.clone();
+        let bad = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = task_stop.cancelled() => break,
+                    _ = provider.select_next_some() => {},
+                    Some((_, mut stream)) = files.next() => {
+                        let request = read_frame::<_, Request>(&mut stream).await?;
+                        ensure!(matches!(request, Request::File { .. }), "Expected a file request");
+                        write_frame(&mut stream, &Response::File { manifest: served_manifest.clone() }).await?;
+                        stream.write_all(&vec![0; served_manifest.size as usize]).await?;
+                        write_frame(&mut stream, &Response::Done).await?;
+                        stream.close().await?;
+                    }
+                }
+            }
+            Ok::<_, anyhow::Error>(())
+        });
+        let b = Node::start(member.clone(), false).await?;
+        b.connect(owner_peer, provider_address).await?;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while b
+                .diagnostics
+                .borrow()
+                .get(&owner_peer)
+                .is_none_or(|d| d.state != ConnectionState::Direct)
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await?;
+        member
+            .lock()
+            .await
+            .remote
+            .insert(manifest.file_id, manifest.clone());
+        let output = root.path().join("output");
+        tokio::fs::create_dir(&output).await?;
+        let id = b.receive(manifest.file_id, output.clone()).await?;
+        wait(&member, |v| {
+            v.transfers
+                .iter()
+                .any(|t| t.id == id && t.status == "Failed")
+        })
+        .await?;
+        let e = member.lock().await;
+        assert!(e.transfers[&id]
+            .error
+            .as_deref()
+            .is_some_and(|s| s.contains("integrity verification failed")));
+        assert!(e.persisted.partials.is_empty());
+        drop(e);
+        assert!(tokio::fs::read_dir(output)
+            .await?
+            .next_entry()
+            .await?
+            .is_none());
+        b.shutdown.cancel();
+        stop.cancel();
+        bad.await??;
+        Ok(())
+    }
+    #[test]
+    fn routes_prefer_lan_then_public_direct_then_circuit() -> Result<()> {
+        let peer = libp2p::identity::Keypair::generate_ed25519()
+            .public()
+            .to_peer_id();
+        let relay = libp2p::identity::Keypair::generate_ed25519()
+            .public()
+            .to_peer_id();
+        let circuit: Multiaddr = format!("/ip4/8.8.8.8/tcp/42/p2p/{relay}/p2p-circuit").parse()?;
+        let public: Multiaddr = "/ip4/1.1.1.1/udp/42/quic-v1".parse()?;
+        let lan: Multiaddr = "/ip4/192.168.1.2/udp/42/quic-v1".parse()?;
+        assert_eq!(
+            preferred_routes(peer, vec![circuit.clone(), public.clone(), lan.clone()]),
+            vec![lan, public, circuit]
+        );
+        Ok(())
+    }
 }

@@ -52,6 +52,13 @@ impl Settings {
                 public_address(&address),
                 "Use a public literal IP address with a nonzero port"
             );
+            ensure!(
+                matches!(
+                    address.iter().next(),
+                    Some(libp2p::multiaddr::Protocol::Ip4(_))
+                ),
+                "The built-in host listens on IPv4; use an IPv4 public address"
+            );
         }
         for address in &self.relays {
             relay_address(address)?;
@@ -71,6 +78,17 @@ pub fn relay_address(value: &str) -> Result<(PeerId, Multiaddr)> {
         "Configured relay must use a public literal IP address"
     );
     Ok((peer, address))
+}
+pub(crate) fn relay_choices(addresses: &[String], rotation: usize) -> Vec<(PeerId, Multiaddr)> {
+    let mut peers = std::collections::BTreeSet::new();
+    if addresses.is_empty() {
+        return Vec::new();
+    }
+    (0..addresses.len())
+        .filter_map(|index| relay_address(&addresses[(index + rotation) % addresses.len()]).ok())
+        .filter(|(peer, _)| peers.insert(*peer))
+        .take(3)
+        .collect()
 }
 pub fn config() -> relay::Config {
     relay::Config {
@@ -318,7 +336,12 @@ pub(crate) fn swarm(key: Keypair, cfg: relay::Config) -> Result<Swarm<Host>> {
             .with_idle_connection_timeout(Duration::from_secs(60)),
     ))
 }
-pub(crate) fn start(key: Keypair, settings: &Settings, shutdown: CancellationToken) -> Result<()> {
+pub(crate) fn start(
+    key: Keypair,
+    settings: &Settings,
+    shutdown: CancellationToken,
+    errors: tokio::sync::mpsc::Sender<&'static str>,
+) -> Result<()> {
     if !settings.help_network {
         return Ok(());
     }
@@ -332,7 +355,11 @@ pub(crate) fn start(key: Keypair, settings: &Settings, shutdown: CancellationTok
     }
     tokio::spawn(async move {
         loop {
-            tokio::select! { _ = shutdown.cancelled() => break, _ = swarm.select_next_some() => {} }
+            tokio::select! { _ = shutdown.cancelled() => break, event = swarm.select_next_some() => {
+                if matches!(event, libp2p::swarm::SwarmEvent::ListenerError { .. } | libp2p::swarm::SwarmEvent::ListenerClosed { .. }) {
+                    let _ = errors.try_send("Network assistance listener stopped; check port 42042 and restart Dump. LAN and file sharing remain available.");
+                }
+            } }
         }
     });
     Ok(())
@@ -380,6 +407,20 @@ mod tests {
             .handle_pending_inbound_connection(ConnectionId::new_unchecked(2), &address, &address)
             .is_err());
         assert_eq!(admission.0.len(), 60);
+        let peer = Keypair::generate_ed25519().public().to_peer_id();
+        let configured = vec![
+            format!("/ip4/8.8.8.8/udp/42042/quic-v1/p2p/{peer}"),
+            format!("/ip4/8.8.8.8/tcp/42042/p2p/{peer}"),
+        ];
+        assert_eq!(
+            relay_choices(&configured, 0),
+            vec![relay_address(&configured[0])?]
+        );
+        assert_eq!(
+            relay_choices(&configured, 1),
+            vec![relay_address(&configured[1])?]
+        );
+        assert!(relay_choices(&[], 0).is_empty());
         Ok(())
     }
 

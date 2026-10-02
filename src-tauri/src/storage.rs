@@ -28,6 +28,7 @@ impl Store {
             .context("Cannot read protected state; original data has been preserved")?;
         ensure!(state.version == VERSION, "Unsupported local state version");
         state.key()?;
+        ensure!(state.contacts.len() <= 256, "Too many cached contacts");
         for workspace in state.workspaces.values() {
             workspace.snapshot.verify()?;
         }
