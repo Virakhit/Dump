@@ -88,6 +88,7 @@ The installer linked above remains the LAN-only 0.1.1 release. No new Internet i
 - [Protocol and trust model](docs/PROTOCOL.md).
 - [Security model and reporting guidance](SECURITY.md).
 - [Executed checks and known verification limits](docs/VERIFICATION.md).
+- [Physical-network acceptance plan; scenarios not yet run](docs/NETWORK_ACCEPTANCE.md).
 
 ## License
 

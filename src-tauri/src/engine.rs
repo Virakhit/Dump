@@ -16,6 +16,7 @@ use uuid::Uuid;
 
 pub type Shared = Arc<Mutex<Engine>>;
 pub type Notify = Arc<dyn Fn(View) + Send + Sync>;
+pub(crate) const PARTIAL_CLEANUP_FAILED: &str = "Cannot remove a temporary download. Close any program using it and restart Dump to retry cleanup.";
 
 #[derive(Clone, Serialize)]
 pub struct Pending {
@@ -96,6 +97,7 @@ impl Engine {
     pub fn open(directory: &Path, notify: Notify) -> Result<Shared> {
         let store = Store::new(directory)?;
         let mut persisted = store.load()?;
+        let mut cleanup_failed = false;
         persisted.partials.retain(|partial| {
             // Only recorded, UUID-named Dump partials are eligible for startup cleanup.
             if partial
@@ -103,8 +105,10 @@ impl Engine {
                 .and_then(|n| n.to_str())
                 .is_some_and(|n| n.starts_with(".dump-") && n.ends_with(".part"))
             {
-                return std::fs::remove_file(partial)
+                let failed = std::fs::remove_file(partial)
                     .is_err_and(|err| err.kind() != std::io::ErrorKind::NotFound);
+                cleanup_failed |= failed;
+                return failed;
             }
             false
         });
@@ -126,7 +130,7 @@ impl Engine {
             network_status: "Starting LAN discovery…".into(),
             relay_peers: Vec::new(),
             invite_url: None,
-            last_error: None,
+            last_error: cleanup_failed.then(|| PARTIAL_CLEANUP_FAILED.into()),
             notify,
         })))
     }

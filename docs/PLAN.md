@@ -39,6 +39,8 @@ Initial estimate was 5–7 full-time developer weeks including ~20% buffer. This
 
 Complete these before calling the build a validated beta. Source builds and loopback tests are distinct evidence.
 
+The eight physical-network scenarios, equipment prerequisites and per-attempt evidence format are in [NETWORK_ACCEPTANCE.md](NETWORK_ACCEPTANCE.md). They remain NOT RUN until authorized devices and remote network/relay endpoints are supplied.
+
 The local implementation has passed a separate 8 GiB loopback test; target-machine memory observations and multi-machine behavior remain unverified. See `VERIFICATION.md` for executed checks.
 
 ## v0.2 Internet milestone

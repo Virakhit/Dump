@@ -219,3 +219,103 @@ Still required: rerun the Windows CI job with new diagnostics; physical two/thre
 | `src/main.tsx` | Distinguish Device/Relay Peer IDs, explain migration and actual relay limits, preserve warnings for ongoing relay transfers after direct upgrade |
 | `.github/workflows/check.yml` | Include the patched AutoNAT library regression command in future CI |
 | `README.md`, `SECURITY.md`, `docs/PROTOCOL.md`, `docs/PLAN.md`, `docs/VERIFICATION.md` | Current behavior, migration, safety/limit semantics and separate historical/local/CI/real-network evidence |
+
+## Closure verification — 2026-10-02
+
+This section adds current evidence; it does not replace the earlier failures or reinterpret their causes. The initial checkout was clean on `main`, HEAD `c92f6c4614d24c4a8e8edea0bff642262f521e36` ("Stabilize Internet P2P routing and transfer lifecycle"). The closure checks below used an uncommitted snapshot based on that HEAD; its recorded source hash identifies the tested inputs.
+
+### Current CI versus historical timeout
+
+**PASS — committed baseline CI:** [Windows checks run 37020134515](https://github.com/Virakhit/Dump/actions/runs/37020134515), attempt 1, push event, exact HEAD `c92f6c4614d24c4a8e8edea0bff642262f521e36`. The completed job `110880799323` and every configured check succeeded on Windows Server 2025 / Rust 1.99.0. The job logs show 31 core unit tests, four connectivity tests, four LAN tests and two relay tests passed; the optional 8 GiB check was ignored. Streams passed one, AutoNAT twelve, updater one with one optional public-installer test ignored, and desktop library 32. Those ignored tests are NOT RUN. This supersedes the previous round's then-current "CI not run" status for the committed baseline only.
+
+**INCONCLUSIVE — historical cause:** [failed run 36994791335](https://github.com/Virakhit/Dump/actions/runs/36994791335), attempt 1, belongs to `605f13902b0e909b701a487f6d30adb0495dc44d`. Its invitation deadline failure remains historical evidence. **Historical root cause remains unconfirmed.** The successful newer CI is not proof of the old timeout's cause, nor proof that races cannot exist. No remote workflow was dispatched/rerun. CI for the new uncommitted closure patch is NOT RUN.
+
+### Reproduced defect and minimal fix
+
+**FAIL before / PASS after — partial-cleanup error visibility.** The actual Windows receiver exclusively created and journaled a signed-file partial, wrote bytes, then paused. A test read handle allowed the writer but excluded `FILE_SHARE_DELETE`; cancellation caused a genuine sharing violation. The journal survived receive cleanup and a locked restart, no completed file appeared, and releasing the handle let the next startup clean it. Both receive and startup nevertheless had `last_error=None` before the fix. The pre-fix regression failed in 0.76 seconds with `receive_error_visible=false startup_error_visible=false` and "receive cleanup failure is not visibly actionable" (recorded exit 1). This is a cleanup notification defect, not an explanation of the historical invitation timeout.
+
+`engine.rs` now tracks failed deletion of an already-recorded eligible partial at startup; `network.rs` reports the same bounded guidance from the receive finalizer. The message asks the user to close programs using the temporary download and restart Dump. The original transfer status/cancellation cause, deletion eligibility and persisted cleanup record remain unchanged; protected-state save failures still surface. The after-fix focused regression passed in 0.71 seconds, exit 0. It also checks the error disappears after later successful cleanup. The existing colliding/unowned-partial test is retained.
+
+**PASS — added active-route overlap coverage, no routing production change.** `active_relay_file_keeps_its_route_when_new_requests_upgrade_to_direct` pauses a real signed FILE receive after disk progress, adds a direct authenticated connection, performs a fresh authorized direct catalog exchange, and checks earlier relay connection IDs remain present. The same transfer stays Receiving/relayed while `View.relay_peers` becomes empty, preserving the UI warning's transfer-based eligibility. Resuming verifies exact bytes, manifest length and independent SHA-256, with one final file and no owned partial. Focused development run: one passed, 12.78 seconds, exit 0. This proves the emitted view/route data; native UI rendering is NOT RUN.
+
+Helpers for approved membership, signed file preparation, receive pausing and verified commit were reused within the existing test file. The retained `signed_file_receive_commits_after_real_reprobe_without_disconnect` passed once after this extraction (10.46 seconds, exit 0), preserving its no-overwrite check. Three existing LAN/relay payload assertions retain exact byte equality but now give bounded mismatch messages instead of dumping file bytes on failure. No identity architecture, crypto/wire protocol, relay quota, timeout, resume or automatic retry change was made.
+
+### Reproducible runner and source snapshot
+
+`scripts/verify-stability.ps1` requires Windows/PowerShell 7. Its fixed batch is ten fresh exact invitation-test processes and three fresh core-suite processes with the normal parallel test runner. `-FullValidation` adds the other ten current workflow/local checks. Cargo commands execute sequentially. The runner clears a process-level `RUST_TEST_THREADS` override during execution and restores it afterward; it never passes `--test-threads=1`. All attempts keep command, exit, duration and separate stdout/stderr. Any failure remains a failed aggregate even after later successes; interrupted/missing attempts cannot pass. SHA-256 inventory/HEAD checks surround every command; file-system events also reject edit-and-restore, and watcher errors invalidate evidence. Output must be a fresh ignored directory and existing evidence is never overwritten.
+
+Initial completed runner self-check: PASS, exit 0, with seven synthetic batch cases covering normal/full completion, preserved first failure, edit-and-restore drift, interruption, failure followed by interruption, and zero executed tests; additional checks reject an existing output without changing its sentinel and return nonzero for a missing executable. Root repeated this self-check once before the first runtime batch; it uses no Rust/npm/network runtime and its successful aggregate is explicitly `SIMULATED_PASS`, never runtime PASS. Development tooling failures were preserved: initial PowerShell `$scenario:` parser error (exit 1), false drift from directory-only `Changed` metadata (exit 1), and null result aggregation from `OrderedDictionary` rows (exit 1). Corrected directory event filtering, object rows, bounded capture and invariant Gregorian timestamps passed subsequent self-checks. Locally retained logs include `.tools/closure-runner-selfcheck.log` and `.tools/stability-self-check-latest.log`.
+
+The **first, failed runtime batch** began at `2026-10-02T15:06:29Z`, on Windows 10.0.19045 x64 / PowerShell 7.6.5, Rust/Cargo 1.99.0 (`x86_64-pc-windows-msvc`), Node 24.18.0 and npm 11.17.0, outside the filesystem sandbox used in the previous comparison. Its input snapshot contains 82 files on the above HEAD:
+
+```text
+SHA-256: 4d3560e86f4a7f17b388e599cc29a3215dac7425f8d2bbd868e5a549696a964a
+Evidence: .tools/stability/20261002T150629Z-dca479d2/
+```
+
+The declared fingerprint covers Git-tracked and nonignored untracked source, tests, vendor, scripts/runner, build/package configuration, workflow and `.gitignore`, including path, tracking kind, byte count and file SHA-256. Documentation/root Markdown/LICENSE and ignored build/output directories are excluded so results can be documented afterward. HEAD alone does not identify this dirty source snapshot. The previous round's ten-process results and development focused runs above are not counted as final repetitions.
+
+**FAIL — first batch, exit 1, complete 23/23 command attempts, no source drift.** All 17 Cargo test invocations exited 101 before executing their test bodies: ten focused, three core, streams, AutoNAT, updater and desktop library. Rust's harness panicked because `RUST_TEST_THREADS` was empty: "should be a positive integer." The runner's .NET null setter had left an empty environment variable on this host. A real child PowerShell probe confirmed presence/empty value; the Env provider's removal instead produced absence/null in both parent and child. This is a reproduced runner environment defect, not a networking timeout or a failing application assertion. A truthiness-only synthetic check had missed it.
+
+| Failed command attempts | Exit | Duration seconds, in attempt order |
+|---|---|---|
+| Focused 1–10 | 101 each | 66.335, 1.864, 1.379, 1.360, 1.210, 1.289, 1.656, 1.647, 1.394, 1.451 |
+| Core 1–3 | 101 each | 74.858, 4.685, 2.601 |
+| Streams / AutoNAT / updater / desktop | 101 each | 6.472 / 1.901 / 129.615 / 53.194 |
+
+The independent npm ci/build, fmt, publisher, Clippy and diff commands each completed with exit 0; they do not make this batch successful. No executed Rust cases from this failed batch count toward final repetitions. Its raw logs/ledger are retained in the above ignored directory. The corrected runner uses actual Env-provider deletion and preserves original presence/value on restore. Final tooling self-check: PASS, exit 0, nine synthetic scenarios plus three real child PowerShell environment probes; originally absent, empty and populated variables are each restored accurately. Root repeated that corrected self-check once (`.tools/closure-runner-selfcheck-final.log`); no Rust/npm/network test cases are claimed by it. `metadata.json`, `source-snapshot.json`, `attempts.jsonl` and `summary.json` are local ignored evidence, not committed raw logs.
+
+### Final frozen-source batch
+
+The fresh batch began at `2026-10-02T15:17:12Z`, with the same Windows/MSVC/toolchain environment and HEAD. Its 82-input fingerprint includes the corrected runner/self-check. Both original and effective thread-variable presence are false; the child environment uses the normal parallel Rust test runner.
+
+```text
+Final input SHA-256: 3fcbd03984ebbfd533b84f0646efbe707d5cdc467c58405709352c93f195e0c0
+Evidence: .tools/stability/20261002T151712Z-a5936118/
+```
+
+**PASS — final batch, exit 0, complete 23/23 command attempts**, finished `2026-10-02T15:28:52Z`. Every before/after fingerprint equals the final hash above; source-change count is zero and the failure ledger is empty. Earlier batch passes/failures and development test runs remain separate; only this snapshot's executed repetitions are final evidence.
+
+| Command | Final executed result | Exit / duration seconds |
+|---|---|---|
+| `npm ci` | PASS, once | 0 / 16.193 |
+| `npm run build` | PASS, once | 0 / 6.499 |
+| `cargo fmt --manifest-path src-tauri/Cargo.toml --check` | PASS, once | 0 / 1.034 |
+| Exact focused invitation command from the runner, `--no-default-features --locked --lib ... -- --exact --nocapture` | PASS, 10/10 fresh processes, one executed test each | 0 each / 28.365, 28.844, 24.921, 26.435, 24.975, 24.558, 25.147, 26.794, 25.312, 27.494 |
+| `cargo test --manifest-path src-tauri/Cargo.toml --no-default-features --locked` | PASS, 3/3 normal-parallel suites; each 33 unit + 4 connectivity + 4 LAN + 2 relay = 43 passed | 0 each / 151.154, 66.973, 70.571 |
+| `cargo test --manifest-path src-tauri/Cargo.toml --locked -p libp2p-stream --lib` | PASS, once, one test | 0 / 2.448 |
+| `cargo test --manifest-path src-tauri/Cargo.toml --locked -p libp2p-autonat --lib` | PASS, once, twelve tests | 0 / 1.349 |
+| `cargo test --manifest-path src-tauri/Cargo.toml --features updater-tests --test updater --locked` | PASS, once, one test; optional public-installer check NOT RUN | 0 / 58.266 |
+| `cargo test --manifest-path src-tauri/Cargo.toml --lib --locked` | PASS, once, 34 tests | 0 / 31.421 |
+| `node --test scripts/publish-update.test.cjs` | PASS, once, one test | 0 / 0.245 |
+| `cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked -- -D warnings` | PASS, once | 0 / 6.656 |
+| `git diff --check` | PASS, once in batch; repeated after final documentation | 0 / 0.089 in batch |
+
+Durations include Cargo preparation/compilation, not just runtime. In the ten focused tests, the largest recorded stage times were relay listen 0.003 s, owner reservation 0.158 s, member-to-owner circuit 0.176 s, owner join request 3.934 s, approval 4.009 s, catalog/manifest 1.932 s, file transfer 15.358 s and outsider contact denial 0.044 s. The existing stage deadlines/readiness/protocol assertions remain unchanged. Successful awaited node/relay cleanup completed each run. No timeout was reproduced in these repetitions; this does not prove absence of races or identify the old failure.
+
+| Invariant group | Final Windows/local evidence |
+|---|---|
+| Identity / authorization | Both relay-first/app-first regressions, relay-not-member and outsider catalog/contact/file denial, DPAPI restart/migration preserving device key/signed state/remote pins, wrong-identity rejection passed in all three core runs. No identity architecture was changed again. |
+| Relay / transfer lifecycle | All six reduced-budget regressions passed: within budget, byte/lifetime close, earlier traffic/overhead, relay shutdown, direct beyond relay budget and no automatic retry/circuit churn. New overlapping direct upgrade preserves the active relay stream/label and verified completion; existing relay integrations also passed. |
+| AutoNAT | Live-connection re-probe, renewed/expired/failed evidence, bounded churn/cache, no-server Unknown, strict evidence/identity and forged-success denial passed through existing wrapper/library tests; signed file survives real test-local re-probe. Clock-advanced and loopback results remain simulated/local evidence. |
+| Local files | Existing collision/owned-journal, corrupt-byte SHA-256 failure and no-overwrite checks passed. New sharing-violation regression proves terminal cancellation, retained record/actionable error on failed receive/startup cleanup and successful later cleanup. |
+
+Each core run ignored the optional 8 GiB case; it is NOT RUN in this closure round. Core's feature-disabled updater integration and empty doctest sections execute zero tests and count as no additional passes. The separate updater command executed its one local signed-fixture case; its public-installer case remains ignored/NOT RUN. All Windows-gated tests above actually ran on Windows. No test traffic used public relay/probe/installer services. The conclusion is **no regression observed in the final executed rounds**, with the limits below.
+
+Changed files in this closure patch:
+
+| Files | Reason |
+|---|---|
+| `src-tauri/src/engine.rs`, `src-tauri/src/network.rs` | Minimal receive/startup cleanup visibility fix with shared bounded guidance |
+| `src-tauri/src/network_reachability_tests.rs` | Two genuine signed FILE regressions; reuse existing approval/pause/commit helpers |
+| `src-tauri/tests/lan.rs`, `src-tauri/tests/relay.rs` | Exact payload assertions with bounded failure text |
+| `scripts/verify-stability.ps1`, `scripts/verify-stability.test.ps1` | Repeatable frozen-source runner and synthetic/real-child environment safety checks |
+| `README.md`, `SECURITY.md`, `docs/PROTOCOL.md`, `docs/PLAN.md`, `docs/DEVELOPMENT.md`, `docs/VERIFICATION.md`, `docs/NETWORK_ACCEPTANCE.md` | Cleanup behavior, runner usage, preserved failure/final evidence and explicit unexecuted physical acceptance plan |
+
+The workflow already retains bounded Rust failure output and runs the affected core tests; its commands did not need another change. No heavy repetition job, success-swallowing behavior or remote execution was added.
+
+### Physical networks and compatibility
+
+**NOT RUN — all eight physical acceptance scenarios** in [NETWORK_ACCEPTANCE.md](NETWORK_ACCEPTANCE.md). Device inventory offers only the same local desktop (connector status Offline); no second/third authorized Windows device, reachable owned relay or controlled different-network endpoint is available. The plan records source/build/topology/actual route/file SHA-256 and sanitized stage evidence for offline LAN, cross-network direct/relay, UDP-blocked TCP, co-hosted owner/relay, relay loss, long-session/address changes and eventual signed revocation. Missing operator controls for a same-session connection order are explicitly untested. Loopback, simulated clock advances and CI cannot replace these gates.
+
+No migration or compatibility format changed in this closure patch: separate persisted device/relay identities, signed workspace/manifest state, remote relay pins, opt-in hosting and all existing limits remain as in `c92f6c4`. Native warning/error layout/interaction, physical firewall/NAT/CGNAT behavior and the source-built multi-device acceptance matrix remain necessary before general distribution. At completion of local verification, no commit/push, installer/version/update-channel change, release or infrastructure deployment had been performed. Subsequent user-authorized commit/push does not extend the recorded baseline CI coverage to this patch.

@@ -120,7 +120,10 @@ async fn authenticated_quic_file_loop_and_revocation() -> Result<()> {
         "transfer failed: {:?}",
         completed
     );
-    assert_eq!(std::fs::read(destination.join(&manifest.name))?, payload);
+    ensure!(
+        std::fs::read(destination.join(&manifest.name))? == payload,
+        "received file bytes differ"
+    );
     assert!(c.lock().await.persisted.partials.is_empty());
     // Existing files are preserved rather than overwritten.
     let duplicate = nc.receive(manifest.file_id, destination.clone()).await?;
@@ -130,7 +133,10 @@ async fn authenticated_quic_file_loop_and_revocation() -> Result<()> {
             .any(|t| t.id == duplicate && t.status == "Failed")
     })
     .await?;
-    assert_eq!(std::fs::read(destination.join(&manifest.name))?, payload);
+    ensure!(
+        std::fs::read(destination.join(&manifest.name))? == payload,
+        "received file bytes differ"
+    );
     let cancelled_dir = root.path().join("cancelled");
     std::fs::create_dir(&cancelled_dir)?;
     let cancelled = nc.receive(manifest.file_id, cancelled_dir.clone()).await?;

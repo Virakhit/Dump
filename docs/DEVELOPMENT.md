@@ -48,6 +48,21 @@ cargo test --release --manifest-path src-tauri/Cargo.toml --no-default-features 
 
 Current local evidence is recorded in [docs/VERIFICATION.md](VERIFICATION.md). This is an alpha build; review those limits before distributing it.
 
+### Repeat Internet stability checks on Windows
+
+Use PowerShell 7 with source, tests and build inputs frozen for the whole batch:
+
+```powershell
+pwsh -NoProfile -File scripts/verify-stability.test.ps1
+pwsh -NoProfile -File scripts/verify-stability.ps1 -FullValidation
+```
+
+The runner starts ten fresh focused invitation-test processes and three normal-parallel core suites. `-FullValidation` also executes the current workflow's npm, formatting, package, updater, desktop, publisher, Clippy and diff checks; Cargo processes run sequentially. Without that switch it runs only the ten-plus-three stability batch. It does not include ignored public-installer or 8 GiB tests, contact a public relay, dispatch CI or publish anything.
+
+Each batch writes HEAD, working-tree status, input SHA-256 inventory, tool/Windows versions, command exits/durations and separate stdout/stderr to a fresh ignored `.tools/stability/` directory. Read `summary.json`: any failed attempt keeps a nonzero result even if later attempts pass. A missing/interrupted command or changed source invalidates completed verification; edit-and-restore is detected too. Freeze again and start a separate batch after a change; never combine repetitions from different snapshots. Documentation and ignored build/output directories are outside the declared input fingerprint so results can be recorded afterward. The small runner self-check uses synthetic commands and is tooling evidence only.
+
+Loopback/CI success is separate from the physical-device gates in [NETWORK_ACCEPTANCE.md](NETWORK_ACCEPTANCE.md). Do not infer real NAT behavior from this batch.
+
 ## Publish an update on GitHub
 
 The repository's `TAURI_SIGNING_PRIVATE_KEY` Actions secret holds the updater signing key. `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` is optional for an encrypted key. Use the same key for every release.

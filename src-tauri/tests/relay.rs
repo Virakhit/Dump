@@ -186,7 +186,10 @@ async fn circuit_carries_join_catalog_file_and_direct_takes_over() -> Result<()>
             e.transfers[&transfer]
         );
     }
-    assert_eq!(std::fs::read(destination.join(&manifest.name))?, payload);
+    ensure!(
+        std::fs::read(destination.join(&manifest.name))? == payload,
+        "received file bytes differ"
+    );
     assert!(member.lock().await.persisted.partials.is_empty());
     assert_eq!(
         a.diagnostics.borrow()[&member_id.parse()?].hole_punch_succeeded,

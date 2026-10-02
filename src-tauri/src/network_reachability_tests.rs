@@ -136,20 +136,21 @@ async fn finished(
     .context("file/reprobe completion")?
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn signed_file_receive_commits_after_real_reprobe_without_disconnect() -> Result<()> {
-    let root = tempfile::tempdir()?;
-    let owner = Engine::open(&root.path().join("owner"), Arc::new(|_| {}))?;
-    let (updates, mut events) = watch::channel(None);
+async fn approved_pair(root: &Path) -> Result<(Shared, Shared, watch::Receiver<Option<View>>)> {
+    let owner = Engine::open(&root.join("owner"), Arc::new(|_| {}))?;
+    let (updates, events) = watch::channel(None);
     let member = Engine::open(
-        &root.path().join("member"),
+        &root.join("member"),
         Arc::new(move |view| {
             updates.send_replace(Some(view));
         }),
     )?;
-    owner.lock().await.create_workspace("Revalidation".into())?;
+    owner
+        .lock()
+        .await
+        .create_workspace("Transfer lifecycle".into())?;
     let member_peer = member.lock().await.peer();
-    // A genuine owner-signed roster isolates transfer/revalidation from invitation timing.
+    // A genuine owner-signed roster isolates file lifecycle tests from invitation timing.
     let workspace = {
         let mut e = owner.lock().await;
         let mut next = e.persisted.clone();
@@ -173,6 +174,115 @@ async fn signed_file_receive_commits_after_real_reprobe_without_disconnect() -> 
             .insert(workspace.snapshot.workspace_id, workspace);
         e.persist(next)?;
     }
+    Ok((owner, member, events))
+}
+
+async fn connection(node: &Node, peer: PeerId, state: ConnectionState) -> Result<()> {
+    let mut diagnostics = node.diagnostics.clone();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if diagnostics
+                .borrow()
+                .get(&peer)
+                .is_some_and(|d| d.state == state)
+            {
+                return Ok::<_, anyhow::Error>(());
+            }
+            diagnostics.changed().await?;
+        }
+    })
+    .await
+    .context("file lifecycle application connection")??;
+    Ok(())
+}
+
+async fn signed_file(
+    root: &Path,
+    owner: &Shared,
+    receiver: &Node,
+    name: &str,
+) -> Result<(Manifest, Vec<u8>, PathBuf)> {
+    let source = root.join(name);
+    let payload: Vec<u8> = (0..2 * BLOCK + 17).map(|i| (i % 251) as u8).collect();
+    tokio::fs::write(&source, &payload).await?;
+    share_paths(owner.clone(), vec![source]).await?;
+    let owner_peer = owner.lock().await.key.public().to_peer_id();
+    receiver
+        .refresh_peer(owner_peer)
+        .await
+        .context("file lifecycle authorized signed catalog")?;
+    let manifest = receiver
+        .shared
+        .lock()
+        .await
+        .remote
+        .values()
+        .find(|m| m.name == name)
+        .context("signed manifest missing")?
+        .clone();
+    manifest.verify()?;
+    let output = root.join("received");
+    tokio::fs::create_dir(&output).await?;
+    Ok((manifest, payload, output))
+}
+
+async fn pause_receive(
+    node: &Node,
+    manifest: &Manifest,
+    output: &Path,
+) -> Result<(Uuid, oneshot::Sender<()>)> {
+    let (started, progress) = oneshot::channel();
+    let (resume, resumed) = oneshot::channel();
+    *node.limits.receive_pause.lock().await = Some(ReceivePause {
+        started,
+        resume: resumed,
+    });
+    let id = node.receive(manifest.file_id, output.to_path_buf()).await?;
+    tokio::time::timeout(Duration::from_secs(10), progress)
+        .await
+        .context("file lifecycle active disk-write progress")??;
+    let e = node.shared.lock().await;
+    let transfer = &e.transfers[&id];
+    ensure!(
+        transfer.status == "Receiving" && transfer.bytes > 0 && transfer.bytes < transfer.total,
+        "receive was not active before lifecycle transition"
+    );
+    ensure!(
+        e.persisted.partials.len() == 1,
+        "active receive has no recorded partial"
+    );
+    ensure!(
+        !output.join(&manifest.name).exists(),
+        "destination committed before verification"
+    );
+    Ok((id, resume))
+}
+
+async fn committed(node: &Node, manifest: &Manifest, payload: &[u8], output: &Path) -> Result<()> {
+    let bytes = tokio::fs::read(output.join(&manifest.name)).await?;
+    ensure!(
+        bytes == payload && bytes.len() as u64 == manifest.size,
+        "committed file bytes/size mismatch"
+    );
+    ensure!(
+        hex::encode(Sha256::digest(&bytes)) == manifest.sha256,
+        "committed file SHA-256 mismatch"
+    );
+    ensure!(
+        node.shared.lock().await.persisted.partials.is_empty(),
+        "completed file left a recorded partial"
+    );
+    ensure!(
+        std::fs::read_dir(output)?.count() == 1,
+        "completed file left a partial"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn signed_file_receive_commits_after_real_reprobe_without_disconnect() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let (owner, member, mut events) = approved_pair(root.path()).await?;
     let mut session = Session(Vec::new());
     let result = async {
         session.0.push(Node::start(owner.clone(), false).await?);
@@ -181,13 +291,7 @@ async fn signed_file_receive_commits_after_real_reprobe_without_disconnect() -> 
         let b = &session.0[1];
         let owner_peer = owner.lock().await.key.public().to_peer_id();
         b.connect(owner_peer, listener(a).await?).await?;
-        let mut diagnostics = b.diagnostics.clone();
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                if diagnostics.borrow().get(&owner_peer).is_some_and(|d| d.state == ConnectionState::Direct) { return Ok::<_, anyhow::Error>(()); }
-                diagnostics.changed().await?;
-            }
-        }).await.context("file/reprobe application connection")??;
+        connection(b, owner_peer, ConnectionState::Direct).await?;
 
         let mut server = SwarmBuilder::with_new_identity().with_tokio().with_quic().with_behaviour(|key| ProbeServer {
             nat: Default::default(),
@@ -221,27 +325,8 @@ async fn signed_file_receive_commits_after_real_reprobe_without_disconnect() -> 
         probe(b, owner_peer, Some(listener(b).await?), false).await?;
         confirmed(b, 1).await?;
 
-        let source = root.path().join("reprobe.bin");
-        let payload: Vec<u8> = (0..2 * BLOCK + 17).map(|i| (i % 251) as u8).collect();
-        tokio::fs::write(&source, &payload).await?;
-        share_paths(owner.clone(), vec![source]).await?;
-        b.refresh_peer(owner_peer).await.context("file/reprobe authorized signed catalog")?;
-        let manifest = member.lock().await.remote.values().find(|m| m.name == "reprobe.bin").context("signed manifest missing")?.clone();
-        manifest.verify()?;
-        let output = root.path().join("received");
-        tokio::fs::create_dir(&output).await?;
-        let (started, progress) = oneshot::channel();
-        let (resume, resumed) = oneshot::channel();
-        *b.limits.receive_pause.lock().await = Some(ReceivePause { started, resume: resumed });
-        let id = b.receive(manifest.file_id, output.clone()).await?;
-        tokio::time::timeout(Duration::from_secs(10), progress).await.context("file/reprobe active disk-write progress")??;
-        {
-            let e = member.lock().await;
-            let t = &e.transfers[&id];
-            ensure!(t.status == "Receiving" && t.bytes > 0 && t.bytes < t.total, "receive was not active before refresh");
-            ensure!(e.persisted.partials.len() == 1, "active receive has no recorded partial");
-        }
-        ensure!(!output.join(&manifest.name).exists(), "destination committed before verification");
+        let (manifest, payload, output) = signed_file(root.path(), &owner, b, "reprobe.bin").await?;
+        let (id, resume) = pause_receive(b, &manifest, &output).await?;
         let before = probe(b, owner_peer, None, false).await?;
         ensure!(!before.is_empty(), "application connection missing before re-probe");
         let count = *b.nat_confirmations.borrow();
@@ -252,15 +337,187 @@ async fn signed_file_receive_commits_after_real_reprobe_without_disconnect() -> 
         ensure!(member.lock().await.transfers[&id].status == "Receiving", "revalidation interrupted signed file receive");
         resume.send(()).map_err(|_| anyhow::anyhow!("receiver stopped while refreshing"))?;
         finished(b, &mut events, id, true).await?;
-        let bytes = tokio::fs::read(output.join(&manifest.name)).await?;
-        ensure!(bytes == payload && bytes.len() as u64 == manifest.size, "committed file bytes/size mismatch");
-        ensure!(hex::encode(Sha256::digest(&bytes)) == manifest.sha256, "committed file SHA-256 mismatch");
-        ensure!(member.lock().await.persisted.partials.is_empty(), "completed file left a recorded partial");
-        ensure!(std::fs::read_dir(&output)?.count() == 1, "completed file left a partial");
+        committed(b, &manifest, &payload, &output).await?;
         let collision = b.receive(manifest.file_id, output.clone()).await?;
         finished(b, &mut events, collision, false).await?;
         ensure!(tokio::fs::read(output.join(&manifest.name)).await? == payload, "existing destination was overwritten");
         ensure!(member.lock().await.persisted.partials.is_empty(), "collision left a recorded partial");
+        Ok::<_, anyhow::Error>(())
+    }.await;
+    let cleanup = session.close().await;
+    result?;
+    cleanup
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn active_relay_file_keeps_its_route_when_new_requests_upgrade_to_direct() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let (owner, member, mut events) = approved_pair(root.path()).await?;
+    let mut session = Session(Vec::new());
+    let result = async {
+        session.0.push(Node::start(owner.clone(), false).await?);
+        session.0.push(Node::start(member.clone(), false).await?);
+        let a = &session.0[0];
+        let b = &session.0[1];
+        let owner_peer = owner.lock().await.key.public().to_peer_id();
+        let mut relay = crate::relay_host::swarm(
+            libp2p::identity::Keypair::generate_ed25519(),
+            crate::relay_host::config(),
+        )?;
+        let relay_peer = *relay.local_peer_id();
+        relay.listen_on("/ip4/127.0.0.1/udp/0/quic-v1".parse()?)?;
+        let address = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let SwarmEvent::NewListenAddr { address, .. } = relay.select_next_some().await {
+                    break address;
+                }
+            }
+        })
+        .await
+        .context("active route relay listener")?;
+        relay.add_external_address(address.clone()); // Test-local loopback only.
+        let stop = b.shutdown.clone();
+        b.tasks.spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = stop.cancelled() => break,
+                    _ = relay.select_next_some() => {},
+                }
+            }
+        });
+        a.reserve_relay(relay_peer, address).await?;
+        let mut reservations = a.relay_addresses.clone();
+        let circuit = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(address) = reservations.borrow().first().cloned() {
+                    return Ok::<_, anyhow::Error>(address);
+                }
+                reservations.changed().await?;
+            }
+        })
+        .await
+        .context("active route relay reservation")??;
+        b.connect(owner_peer, circuit).await?;
+        connection(b, owner_peer, ConnectionState::Relay).await?;
+        let (manifest, payload, output) =
+            signed_file(root.path(), &owner, b, "route-upgrade.bin").await?;
+        let (id, resume) = pause_receive(b, &manifest, &output).await?;
+        ensure!(
+            member.lock().await.transfers[&id].relayed,
+            "active file did not use the circuit"
+        );
+        let before = probe(b, owner_peer, None, false).await?;
+        ensure!(
+            !before.is_empty(),
+            "relay application connection is missing"
+        );
+
+        b.connect(owner_peer, listener(a).await?).await?;
+        connection(b, owner_peer, ConnectionState::Direct).await?;
+        // This is a fresh, authorized application exchange after the direct upgrade.
+        b.refresh_peer(owner_peer)
+            .await
+            .context("active route direct catalog")?;
+        let after = probe(b, owner_peer, None, false).await?;
+        ensure!(
+            before.is_subset(&after) && after.len() > before.len(),
+            "direct upgrade replaced the active relay connection"
+        );
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let view = member.lock().await.view();
+                let transfer = view
+                    .transfers
+                    .iter()
+                    .find(|t| t.id == id)
+                    .context("active relay transfer disappeared")?;
+                ensure!(
+                    transfer.status == "Receiving" && transfer.relayed,
+                    "direct upgrade changed the active transfer's route/state"
+                );
+                if view.relay_peers.is_empty() {
+                    // The frontend's warning must remain eligible from this transfer,
+                    // even though every peer now has a preferred direct route.
+                    ensure!(
+                        view.transfers.iter().any(|t| t.relayed
+                            && !["Completed", "Cancelled", "Failed"].contains(&t.status.as_str())),
+                        "active relay warning data disappeared after direct upgrade"
+                    );
+                    return Ok::<_, anyhow::Error>(());
+                }
+                events.changed().await?;
+            }
+        })
+        .await
+        .context("active route warning state")??;
+        resume
+            .send(())
+            .map_err(|_| anyhow::anyhow!("active relay receive stopped during direct upgrade"))?;
+        finished(b, &mut events, id, true).await?;
+        ensure!(
+            member.lock().await.transfers[&id].relayed,
+            "completed relay transfer was relabeled direct"
+        );
+        committed(b, &manifest, &payload, &output).await?;
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    let cleanup = session.close().await;
+    result?;
+    cleanup
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_partial_deletion_is_recorded_and_visible_until_restart_can_clean() -> Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let root = tempfile::tempdir()?;
+    let (owner, member, mut events) = approved_pair(root.path()).await?;
+    let mut session = Session(Vec::new());
+    let result = async {
+        session.0.push(Node::start(owner.clone(), false).await?);
+        session.0.push(Node::start(member.clone(), false).await?);
+        let a = &session.0[0];
+        let b = &session.0[1];
+        let owner_peer = owner.lock().await.key.public().to_peer_id();
+        b.connect(owner_peer, listener(a).await?).await?;
+        connection(b, owner_peer, ConnectionState::Direct).await?;
+        let (manifest, _, output) = signed_file(root.path(), &owner, b, "busy-partial.bin").await?;
+        let (id, _resume) = pause_receive(b, &manifest, &output).await?;
+        let part = output.join(format!(".dump-{id}.part"));
+        // Permit the active writer, but exclude FILE_SHARE_DELETE so the real
+        // receive cleanup encounters a Windows sharing violation after cancel.
+        let busy = std::fs::OpenOptions::new().read(true).share_mode(3).open(&part)?;
+        member.lock().await.cancel(id)?;
+        let receive_error = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let e = member.lock().await;
+                let transfer = &e.transfers[&id];
+                if ["Cancelled", "Failed", "Completed"].contains(&transfer.status.as_str()) {
+                    ensure!(transfer.status == "Cancelled", "busy partial cancellation ended as {}", transfer.status);
+                    ensure!(transfer.error.as_deref() == Some("Transfer cancelled"), "cleanup changed the original cancellation cause");
+                    ensure!(e.persisted.partials.contains(&part), "failed receive deletion lost its cleanup record");
+                    ensure!(part.exists() && !output.join(&manifest.name).exists(), "cancelled partial was falsely committed or disappeared");
+                    return Ok::<_, anyhow::Error>(e.last_error.clone());
+                }
+                drop(e);
+                events.changed().await?;
+            }
+        }).await.context("busy partial receive cancellation")??;
+        session.close().await?;
+        let reopened = Engine::open(&root.path().join("member"), Arc::new(|_| {}))?;
+        let startup_error = {
+            let e = reopened.lock().await;
+            ensure!(e.persisted.partials.contains(&part) && part.exists(), "busy startup cleanup lost its record");
+            e.last_error.clone()
+        };
+        eprintln!("busy partial cleanup: receive_journal_retained=true startup_journal_retained=true receive_error_visible={} startup_error_visible={}", receive_error.is_some(), startup_error.is_some());
+        drop(busy);
+        let retried = Engine::open(&root.path().join("member"), Arc::new(|_| {}))?;
+        ensure!(!part.exists() && retried.lock().await.persisted.partials.is_empty(), "released partial was not cleaned on the next startup");
+        ensure!(receive_error.as_deref().is_some_and(|message| message.contains("temporary download") && message.contains("restart")), "receive cleanup failure is not visibly actionable");
+        ensure!(startup_error.as_deref().is_some_and(|message| message.contains("temporary download") && message.contains("restart")), "startup cleanup failure is not visibly actionable");
+        ensure!(retried.lock().await.last_error.is_none(), "successful later cleanup retained a stale cleanup error");
         Ok::<_, anyhow::Error>(())
     }.await;
     let cleanup = session.close().await;

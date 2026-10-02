@@ -4,7 +4,7 @@ use crate::{
         ConnectionState, Diagnostics, DialFailure, ProtocolOutcome, Reachability,
         ReachabilityStatus, MAX_ADDRESSES,
     },
-    engine::{open_source, refresh_share, stamp, Shared},
+    engine::{open_source, refresh_share, stamp, Shared, PARTIAL_CLEANUP_FAILED},
     holepunch::HolePunch,
     identify::Identify,
     model::*,
@@ -1109,6 +1109,9 @@ impl Node {
                 next.partials.retain(|p| p != &part);
             } else if created && !next.partials.contains(&part) {
                 next.partials.push(part.clone());
+            }
+            if !cleaned {
+                e.error(PARTIAL_CLEANUP_FAILED);
             }
             if let Err(err) = e.persist(next) {
                 e.error(format!("Cannot save download state: {err}"));
