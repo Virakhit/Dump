@@ -15,6 +15,7 @@ Original requirements: `requirement.md`. Decisions from the planning conversatio
 - SHA-256 and owner-signed manifests; streamed `.part` downloads and verified no-overwrite completion.
 - Membership snapshots use a pinned owner key and monotonic revisions. No owner transfer or key recovery workflow in v0.1.
 - At most one workspace active. Share refreshes are bound to the original workspace/version and cannot cross groups.
+- User-requested 0.1.1 extension: manually check GitHub for newer published releases and install signed updates in the app. A public HTTPS channel manifest and the native Tauri updater bind installer signatures to their app version; LAN discovery and file transfers retain their original scope.
 
 ## Milestones
 
