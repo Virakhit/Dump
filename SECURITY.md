@@ -32,4 +32,4 @@ Protect the Windows profile: there is no v0.1 key recovery/export. Losing the ow
 
 ## Reporting
 
-Do not publish real invite tokens, private keys, workspace secrets, user files, local paths, or personal network captures in an issue. A public reporting address has not been configured yet; configure a private security-reporting channel before a public release.
+Report suspected vulnerabilities privately through [GitHub security advisories](https://github.com/Virakhit/Dump/security/advisories/new). Private vulnerability reporting is enabled for this repository. Do not publish real invite tokens, private keys, workspace secrets, user files, local paths, or personal network captures in an issue or report.
