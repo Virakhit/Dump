@@ -24,6 +24,7 @@ This records checks on the development Windows machine, not approval for a publi
 - Desktop guard test passed: queued/active transfers and file preparation block installation; completed/cancelled/failed transfers do not.
 - Node's built-in test runner verified release announcement, refusal of incomplete/unsigned manifests and unexpected installer URLs, matching tags, and prevention of channel rollback.
 - The shipping configuration requires HTTPS and the version covered by the pinned public-key signature. HTTP is enabled only in the isolated updater test context.
+- [Remote Windows checks](https://github.com/Virakhit/Dump/actions/runs/36972960239) passed for the updater application source, including core, desktop guard, native updater, publishing tests, formatting, frontend build, and Clippy. Packaging runs separately against the version tag.
 - Full installation/restart through the in-app update button and clean-machine updater behavior remain unverified. The 0.1.0 installer below predates this feature and needs a one-time manual upgrade.
 
 ## Original 0.1.0 artifact

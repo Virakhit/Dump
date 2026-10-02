@@ -5,6 +5,41 @@ use tauri::test::{mock_builder, mock_context, noop_assets};
 use tauri_plugin_updater::UpdaterExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+#[tokio::test]
+#[ignore = "Requires a published update feed and internet; downloads the full Windows installer"]
+async fn published_windows_installer_verifies() -> anyhow::Result<()> {
+    let config: serde_json::Value = serde_json::from_str(include_str!("../tauri.conf.json"))?;
+    let mut context = mock_context(noop_assets());
+    context.package_info_mut().version = "0.1.0".parse()?;
+    context
+        .config_mut()
+        .plugins
+        .0
+        .insert("updater".into(), config["plugins"]["updater"].clone());
+    let app = mock_builder()
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .build(context)?;
+    let mut update = app
+        .updater_builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?
+        .check()
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("No published update newer than 0.1.0"))?;
+    update.timeout = Some(std::time::Duration::from_secs(15 * 60));
+    let bytes = update.download(|_, _| {}, || {}).await?;
+    assert!(
+        bytes.starts_with(b"MZ"),
+        "The signed payload must be a Windows executable"
+    );
+    println!(
+        "Published version {}: {} installer bytes verified",
+        update.version,
+        bytes.len()
+    );
+    Ok(())
+}
+
 // Real HTTP requests through the platform updater; no installer is executed by this check.
 #[tokio::test]
 async fn signed_updates_reject_tampering_and_version_substitution() -> anyhow::Result<()> {

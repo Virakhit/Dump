@@ -69,3 +69,9 @@ node --test scripts/publish-update.test.cjs
 
 Updater checks exercise the real plugin's version comparison and signature verification over loopback, including tampered bytes and an inflated manifest version paired with an older signed artifact. Test fixtures are signed data and public signatures; they contain no private key. HTTP is allowed only in the loopback test context; shipping updates require HTTPS.
 
+After publishing, verify the real public feed and full signed installer without running the installer:
+
+```powershell
+cargo test --manifest-path src-tauri/Cargo.toml --features updater-tests --test updater published_windows_installer_verifies -- --ignored --nocapture
+```
+
