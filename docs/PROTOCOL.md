@@ -8,7 +8,7 @@ Every workspace pins its creator's Peer ID and public key. Only that identity si
 
 ## Discovery
 
-libp2p mDNS advertises multiaddresses and Peer IDs. No workspace IDs, names, member lists, filenames, or hashes are put into discovery records. There is no DHT, rendezvous backend or public user list. The current core has an explicitly configured circuit relay client (Stage 3), with no default infrastructure; the opt-in host role is described below. Local observers can nevertheless correlate running devices and IPs.
+libp2p mDNS advertises multiaddresses and Peer IDs. No invitation codes, workspace IDs, names, member lists, filenames, or hashes are put into discovery records. There is no DHT, rendezvous backend or public user list. The current core has an explicitly configured circuit relay client (Stage 3), with no default infrastructure; the opt-in host role is described below. Local observers can nevertheless correlate running devices and IPs.
 
 The v0.2 Stage 1 core adds Identify and explicit literal-IP QUIC dialing. Identify exposes the device public key, protocol/agent versions, supported transport protocols and the address at which the remote peer was observed. It hides this device's interface listen addresses, and its automatic peer-address cache is disabled. LAN discovery remains independent. Public addresses learned from already known peers are bounded hints, never authorization. Observed public addresses are recorded in local diagnostics only: a peer's report is not evidence that a NAT permits inbound connections. No observed address is promoted to a confirmed external address or advertised in this stage.
 
@@ -57,7 +57,7 @@ Automatic routing order: LAN direct, Internet direct, DCUtR upgrade, retained en
 
 Relays may learn their connected peers' IP addresses, public Peer IDs, requested circuit endpoints, reservation lifetimes, connection timing and approximate traffic volume; they may correlate relationships. E2E session encryption must protect workspace metadata, membership, secrets, filenames, hashes, signed manifests and file bytes. Relays may deny, delay or interrupt delivery. Authentication, signed manifests and receiver length/hash checks must turn tampering into failure, never a silently altered completed file. No anonymity guarantee is made.
 
-Contacts use an Ed25519 signature over the CBOR tuple `("dump/contact/1", peer_id, public_key, sequence, issued_at, expires_at, addresses)`. They contain no workspace data. Each contact has at most eight literal-IP direct/circuit routes (512 characters each), a positive monotonic sequence and a lifetime of at most 24 hours. The signing key must derive the named Peer ID; addresses must be public and identity suffixes must match. Future issuance has at most five minutes of clock tolerance. Creating an invitation renews its owner's contact for the invite's full 24-hour window. No contact or token grants catalog/file access.
+Contacts use an Ed25519 signature over the CBOR tuple `("dump/contact/1", peer_id, public_key, sequence, issued_at, expires_at, addresses)`. They contain no workspace data. Each contact has at most eight literal-IP direct/circuit routes (512 characters each), a positive monotonic sequence and a lifetime of at most 24 hours. The signing key must derive the named Peer ID; addresses must be public and identity suffixes must match. Future issuance has at most five minutes of clock tolerance. Creating a full invitation renews its owner's contact for the invite's full 24-hour window. Short LAN invitations do not carry Internet contacts. No contact or token grants catalog/file access.
 
 At startup, explicitly configured relays are reserved and retried every 15 seconds. Alternatives for the same Peer ID rotate, allowing TCP fallback when QUIC fails. No default relay is contacted. Contact generation includes current confirmed/public listener candidates and accepted public circuit locators; three route slots are kept for relay fallback. Observed addresses supplied by other peers remain unverified diagnostics. Signed listener candidates are hints, not promises about firewall/NAT reachability. Loss/expiry of a reservation withdraws its locator. Changed locators are signed with a higher sequence.
 
@@ -71,7 +71,7 @@ Existing protected v1 device/member identities, workspace data and membership/ma
 
 ## Frames and signatures
 
-Protocols `/dump/control/1` and `/dump/file/1` carry a big-endian four-byte frame length followed by a Serde CBOR message. Frames are limited to 64 KiB and reject trailing bytes/unknown fields. Reads and writes of control frames time out after five seconds.
+Protocols `/dump/control/1`, `/dump/file/1`, and `/dump/lan-invite/1` carry a big-endian four-byte frame length followed by a Serde CBOR message. Frames are limited to 64 KiB and reject trailing bytes/unknown fields. Reads and writes of control frames time out after five seconds.
 
 Signed membership payload is the fixed tuple:
 
@@ -91,13 +91,14 @@ Both use Ed25519 over CBOR bytes. Public keys are base64url-without-padding enco
 
 ## Requests and responses
 
-Serde externally tagged enums define the wire messages:
+Control and file messages use Serde externally tagged enums. The LAN invitation request is a Serde struct and its response is an externally tagged enum:
 
 | Protocol | Request | Response |
 |---|---|---|
 | control | `Join { invitation, name }` | `Waiting`, `Approved { workspace }`, or `Denied` |
 | control | `Catalog { snapshot, offset }` | `Catalog { snapshot, files, total }` or `Denied` |
 | file | `File { snapshot, manifest }` | `File { manifest }`, raw file bytes, then a framed `Done`; or `Denied`/stream reset |
+| `/dump/lan-invite/1` | `{ code }` probe, then `{ code, name }` to the verified owner | `Found { invitation, response }` or `Unavailable`; nested `response` is `Waiting` or `Approved { workspace }` |
 
 Catalog pages contain at most 32 manifests. Totals cannot exceed 10,000, nonterminal pages must advance, and changes in total cause a retry. Every manifest must belong to the transport peer and requested workspace. Partial inventory refreshes are discarded rather than merged into a completed catalog.
 
@@ -105,9 +106,31 @@ The serving peer checks its current share map as well as the signature: an old s
 
 ## Joining
 
-The URI is `dump://join/<base64url(JSON invitation)>`. Invitation fields: `version`, `workspace_id`, `owner_peer_id`, a 256-bit random `token`, and an optional signed `contact`. URLs are limited to 8192 characters; parsing pins the contact to the invitation owner and validates its signature/routes/lifetime. The owner stores the token's SHA-256 digest, expiry, and the transport Peer ID to which approval is bound. The raw token never authorizes catalogs or downloads.
+### Temporary LAN invitations (current source only)
 
-The requester pins the owner from the invite, then sends a bounded join request. The owner compares the displayed authenticated device fingerprint through a trusted channel and explicitly approves it. Approval atomically binds/consumes the token and persists a new signed roster. The same approved Peer ID can retrieve its grant until expiry; another identity cannot reuse that token. Rejecting a request invalidates its invite. The owner must remain in the selected workspace during this process.
+The default **Invite a friend** action creates `dump://lan/<code>`. The code is a 96-bit commitment encoded as exactly 16 base64url characters without padding, giving a 27-character URL:
+
+```
+code = base64url_no_pad(
+  SHA256(b"dump/lan-invite/1\0" || UUID_bytes || token_bytes || PeerID_bytes)[0..12]
+)
+```
+
+The inputs are the workspace UUID's 16 raw bytes, the decoded full 256-bit random invitation token, and the owner's complete serialized Peer ID bytes. The random token supplies the entropy; the commitment binds the workspace, token, and owner instead of carrying their full values in the URL. Before accepting a reply, the recipient recomputes the commitment and checks that the invitation owner matches the authenticated transport Peer ID. LAN invitations have no signed Internet contact.
+
+Initial probes contain only the code. They can return the invitation with `Waiting`, but create no pending join request and disclose no workspace secret or roster. The requester sends its device name only after the current attempt has verified and pinned that specific owner; other discovered candidates never receive the name, including requests already queued when the owner is found. Only this named request enters the normal approval flow. Expired, inactive, or differently bound invitations remain unavailable in either phase.
+
+The invitation expires after ten minutes and remains valid for at most one explicitly approved device. Its full `Invitation` and `InviteRecord` exist only in process memory, outside the persisted full-invitation list. Closing or restarting the owner, or switching the owner's selected workspace, invalidates it; the code cannot restore that state. Successful approval persists the signed membership roster, so an already admitted device remains a member after the temporary invitation disappears.
+
+Resolution and approval polling both use `/dump/lan-invite/1` over authenticated, encrypted QUIC connections to mDNS-discovered private or link-local IP addresses. A LAN invitation's full token is not admitted by the generic `/dump/control/1` join path. The code is not advertised in mDNS, and neither lookup nor approval polling uses public Internet routes, relay circuits, or an Internet resolver. Both devices must be reachable on the same local network; Wi-Fi isolation or blocked discovery can prevent a join. Both need a supporting source build. The published 0.1.1 recipient cannot parse the link, and this change does not publish an updated installer.
+
+### Full invitations and compatibility
+
+The secondary **Use a full link for another network** action keeps the original `dump://join/<base64url(JSON invitation)>` format and 24-hour lifetime. Older JSON invitations remain accepted. Its fields are `version`, `workspace_id`, `owner_peer_id`, a 256-bit random `token`, and an optional signed `contact`; URLs are limited to 8192 characters. The owner stores the token's SHA-256 digest, expiry, and the transport Peer ID to which approval is bound in protected state. Contact parsing pins the record to the invitation owner and validates its signature, routes, and lifetime. A usable route is still necessary for joining from another network.
+
+### Approval
+
+Both invitation modes retain the explicit fingerprint check and owner approval. A full invitation supplies the pinned owner identity directly; a short LAN invitation verifies the resolved owner's identity against its commitment and authenticated local connection. The owner compares the displayed authenticated requester fingerprint through a trusted channel before approving that device. Approval binds the invitation to that Peer ID and persists a new signed roster. The same approved Peer ID can retrieve its grant until the invitation expires or, for LAN links, its runtime state is cleared; another identity cannot reuse it. Rejecting a request invalidates its invitation. The owner must remain in the selected workspace during this process. An invitation code or raw token never authorizes catalogs or downloads.
 
 ## Membership propagation
 
@@ -121,4 +144,4 @@ Source paths are resolved only through local opaque share IDs. Native file picke
 
 Downloads use exclusively created `.dump-<UUID>.part` files in the selected destination folder. DPAPI-protected state records only a successfully created, owned partial before payload writes; a colliding existing file is neither deleted nor recorded for startup cleanup. Flush and close before a Windows no-replace, write-through move. Failed deletion retains the owned path for a later startup retry when state persistence succeeds; receive and startup cleanup display guidance to close programs using the temporary download and restart Dump, preserving the original transfer error. Storage failures are surfaced. A crash between exclusive creation and recording may leave an empty unrecorded partial, which is never swept automatically. Never auto-open received files.
 
-Connection limits, 32 control tasks, 8 file-header tasks, per-peer request rate of 10/second, and transfer semaphores bound resource use. Serving transfers are admitted without an unbounded queue; excess inbound transfers fail. There are two send slots and two receive slots, and one per direction per peer. Availability expires after 15 seconds without a successful authenticated catalog exchange.
+Device connections are capped at 128 established, 16 pending in each direction, and three established per peer. This allows a private QUIC connection for LAN invitations alongside an existing public direct connection and a retained relay circuit. The separate relay-host limits above still apply to forwarding. These connection limits, 32 shared control tasks (including LAN invitations), 8 file-header tasks, per-peer request rate of 10/second, and transfer semaphores bound resource use. Serving transfers are admitted without an unbounded queue; excess inbound transfers fail. There are two send slots and two receive slots, and one per direction per peer. Availability expires after 15 seconds without a successful authenticated catalog exchange.
