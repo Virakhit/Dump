@@ -46,7 +46,12 @@ fn encoded<T: Serialize>(value: &T) -> Result<Vec<u8>> {
 pub(crate) fn sign<T: Serialize>(key: &Keypair, value: &T) -> Result<String> {
     Ok(B64.encode(key.sign(&encoded(value)?)?))
 }
-pub(crate) fn verify<T: Serialize>(public: &str, peer: &str, signature: &str, value: &T) -> Result<()> {
+pub(crate) fn verify<T: Serialize>(
+    public: &str,
+    peer: &str,
+    signature: &str,
+    value: &T,
+) -> Result<()> {
     let key = decode_public(public)?;
     ensure!(
         key.to_peer_id().to_string() == peer,

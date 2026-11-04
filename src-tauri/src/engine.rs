@@ -339,7 +339,10 @@ impl Engine {
             "Not a sent chat message"
         );
         let delivery = entry.delivery.as_ref().context("Not a sent chat message")?;
-        ensure!(delivered <= delivery.attempted, "Invalid chat delivery count");
+        ensure!(
+            delivered <= delivery.attempted,
+            "Invalid chat delivery count"
+        );
         let status = if interrupted {
             ChatDeliveryStatus::Interrupted
         } else {

@@ -60,7 +60,9 @@ async fn join(owner: &Node, member: &Node) -> Result<()> {
     let member_id = member.shared.lock().await.peer();
     member.connect(owner_id, address(owner).await?).await?;
     wait(&owner.shared, "join request", |view| {
-        view.pending.iter().any(|pending| pending.peer_id == member_id)
+        view.pending
+            .iter()
+            .any(|pending| pending.peer_id == member_id)
     })
     .await?;
     owner.shared.lock().await.approve(&member_id)?;
@@ -188,15 +190,18 @@ async fn authenticated_quic_chat_continues_without_owner() -> Result<()> {
         "send must save locally before returning"
     );
     wait(&receiver, "chat receipt", |view| {
-        view.chat_messages.iter().any(|entry| entry.message.id == id)
+        view.chat_messages
+            .iter()
+            .any(|entry| entry.message.id == id)
     })
     .await?;
     wait(&sender, "chat acknowledgement", |view| {
         view.chat_messages.iter().any(|entry| {
             entry.message.id == id
-                && entry.delivery.as_ref().is_some_and(|delivery| {
-                    delivery.status == ChatDeliveryStatus::Complete
-                })
+                && entry
+                    .delivery
+                    .as_ref()
+                    .is_some_and(|delivery| delivery.status == ChatDeliveryStatus::Complete)
         })
     })
     .await?;
@@ -205,7 +210,10 @@ async fn authenticated_quic_chat_continues_without_owner() -> Result<()> {
     assert_eq!(sent.len(), 2);
     assert_eq!(received.len(), 2);
     let sent_message = sent.iter().find(|entry| entry.message.id == id).unwrap();
-    let received_message = received.iter().find(|entry| entry.message.id == id).unwrap();
+    let received_message = received
+        .iter()
+        .find(|entry| entry.message.id == id)
+        .unwrap();
     assert_eq!(sent_message.message, received_message.message);
     assert_eq!(received_message.message.body, body);
     assert_eq!(received_message.message.workspace_id, workspace);
@@ -220,7 +228,9 @@ async fn authenticated_quic_chat_continues_without_owner() -> Result<()> {
 
     let reply = receiver_node.send_chat(workspace, "Got it".into()).await?;
     wait(&sender, "reply receipt", |view| {
-        view.chat_messages.iter().any(|entry| entry.message.id == reply)
+        view.chat_messages
+            .iter()
+            .any(|entry| entry.message.id == reply)
     })
     .await?;
     wait(&receiver, "reply acknowledgement", |view| {
@@ -245,10 +255,24 @@ async fn receive_checks_identity_membership_workspace_and_duplicate_contents() -
     let (owner, sender, receiver, snapshot) = signed_group(root.path()).await?;
     let sender_id = sender.lock().await.peer();
     let owner_id = owner.lock().await.peer();
-    let message = sender
+    let message =
+        sender
+            .lock()
+            .await
+            .compose_chat(snapshot.workspace_id, "Original message".into(), 2)?;
+    // A failed atomic state write must not be acknowledged or appended in memory.
+    let state_path = root.path().join("receiver/state.bin");
+    let before = std::fs::read(&state_path)?;
+    let blocked_write = root.path().join("receiver/state.new");
+    std::fs::create_dir(&blocked_write)?;
+    assert!(receiver
         .lock()
         .await
-        .compose_chat(snapshot.workspace_id, "Original message".into(), 2)?;
+        .receive_chat(&sender_id, &snapshot, message.clone())
+        .is_err());
+    assert!(receiver.lock().await.view().chat_messages.is_empty());
+    assert_eq!(std::fs::read(&state_path)?, before);
+    std::fs::remove_dir(blocked_write)?;
     receiver
         .lock()
         .await
@@ -304,7 +328,10 @@ async fn receive_checks_identity_membership_workspace_and_duplicate_contents() -
     assert_eq!(receiver.lock().await.persisted.chat_messages.len(), 1);
 
     // Both identities remain approved here, isolating active-workspace rejection.
-    receiver.lock().await.create_workspace("Other group".into())?;
+    receiver
+        .lock()
+        .await
+        .create_workspace("Other group".into())?;
     assert!(receiver
         .lock()
         .await
@@ -340,7 +367,8 @@ async fn receive_checks_identity_membership_workspace_and_duplicate_contents() -
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn offline_send_and_restart_preserve_history_and_interrupt_unfinished_delivery() -> Result<()> {
+async fn offline_send_and_restart_preserve_history_and_interrupt_unfinished_delivery() -> Result<()>
+{
     let root = tempfile::tempdir()?;
     let (owner, sender, receiver, snapshot) = signed_group(root.path()).await?;
     let mut stop = StopNodes::default();
@@ -354,9 +382,10 @@ async fn offline_send_and_restart_preserve_history_and_interrupt_unfinished_deli
     wait(&sender, "zero-recipient completion", |view| {
         view.chat_messages.iter().any(|entry| {
             entry.message.id == offline
-                && entry.delivery.as_ref().is_some_and(|delivery| {
-                    delivery.status == ChatDeliveryStatus::Complete
-                })
+                && entry
+                    .delivery
+                    .as_ref()
+                    .is_some_and(|delivery| delivery.status == ChatDeliveryStatus::Complete)
         })
     })
     .await?;
@@ -374,10 +403,11 @@ async fn offline_send_and_restart_preserve_history_and_interrupt_unfinished_deli
         .await
         .compose_chat(workspace, "One acknowledgement".into(), 2)?;
     sender.lock().await.finish_chat(completed.id, 1, false)?;
-    let incoming = owner
-        .lock()
-        .await
-        .compose_chat(workspace, "Received before restart".into(), 2)?;
+    let incoming =
+        owner
+            .lock()
+            .await
+            .compose_chat(workspace, "Received before restart".into(), 2)?;
     let owner_id = owner.lock().await.peer();
     sender
         .lock()

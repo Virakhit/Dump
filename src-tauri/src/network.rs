@@ -405,8 +405,7 @@ impl Node {
         );
         let mut contacts =
             futures::stream::select(control.accept(CONTACT)?, relay_control.accept(CONTACT)?);
-        let mut chats =
-            futures::stream::select(control.accept(CHAT)?, relay_control.accept(CHAT)?);
+        let mut chats = futures::stream::select(control.accept(CHAT)?, relay_control.accept(CHAT)?);
         let (dial, mut dials) = mpsc::channel(128);
         let (protocol_reports, mut reports) = mpsc::channel::<ProtocolReport>(128);
         let tasks = TaskTracker::new();
