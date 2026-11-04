@@ -461,6 +461,13 @@ mod tests {
                 bytes: &[u8],
             ) -> Poll<io::Result<usize>> {
                 self.get_mut().0 += 1;
+                // Framing/encryption has a per-poll cost. Without a useful grant
+                // quantum, even this small cost refills the bucket by a few bytes
+                // and allows write_all to spin without waiting for a useful batch.
+                let until = Instant::now() + Duration::from_micros(10);
+                while Instant::now() < until {
+                    std::hint::spin_loop();
+                }
                 Poll::Ready(Ok(bytes.len()))
             }
             fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
