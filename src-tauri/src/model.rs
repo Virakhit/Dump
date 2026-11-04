@@ -43,10 +43,10 @@ fn encoded<T: Serialize>(value: &T) -> Result<Vec<u8>> {
     ciborium::into_writer(value, &mut bytes)?;
     Ok(bytes)
 }
-fn sign<T: Serialize>(key: &Keypair, value: &T) -> Result<String> {
+pub(crate) fn sign<T: Serialize>(key: &Keypair, value: &T) -> Result<String> {
     Ok(B64.encode(key.sign(&encoded(value)?)?))
 }
-fn verify<T: Serialize>(public: &str, peer: &str, signature: &str, value: &T) -> Result<()> {
+pub(crate) fn verify<T: Serialize>(public: &str, peer: &str, signature: &str, value: &T) -> Result<()> {
     let key = decode_public(public)?;
     ensure!(
         key.to_peer_id().to_string() == peer,
@@ -261,6 +261,8 @@ pub struct Persisted {
     pub partials: Vec<PathBuf>,
     pub history: Vec<AuditEvent>,
     #[serde(default)]
+    pub chat_messages: Vec<crate::chat::StoredChat>,
+    #[serde(default)]
     pub network: crate::relay_host::Settings,
     #[serde(default)]
     pub contacts: BTreeMap<String, crate::contact::Contact>,
@@ -280,6 +282,7 @@ impl Persisted {
             joining: None,
             partials: Vec::new(),
             history: Vec::new(),
+            chat_messages: Vec::new(),
             network: Default::default(),
             contacts: Default::default(),
         })

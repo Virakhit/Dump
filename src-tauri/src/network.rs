@@ -1,4 +1,5 @@
 use crate::{
+    chat::ChatMessage,
     connectivity::{
         diagnostic, direct_address, is_relayed, peer_address, public_address, AddressBook,
         ConnectionState, Diagnostics, DialFailure, ProtocolOutcome, Reachability,
@@ -44,6 +45,7 @@ use uuid::Uuid;
 const CONTROL: StreamProtocol = StreamProtocol::new("/dump/control/1");
 const FILE: StreamProtocol = StreamProtocol::new("/dump/file/1");
 const CONTACT: StreamProtocol = StreamProtocol::new("/dump/contact/1");
+const CHAT: StreamProtocol = StreamProtocol::new("/dump/chat/1");
 const PREAUTH_TIMEOUT: Duration = Duration::from_secs(5);
 const INACTIVITY: Duration = Duration::from_secs(30);
 const RELAY_INTERRUPTED: &str = "Relay connection closed or stalled. Its transfer limit may have been reached. Try again manually using a direct connection or ask the relay operator about limits.";
@@ -154,6 +156,20 @@ struct ContactResponse {
     total: u32,
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ChatRequest {
+    snapshot: Snapshot,
+    message: ChatMessage,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+enum ChatResponse {
+    Stored { message_id: Uuid },
+    Denied,
+}
+
 pub async fn write_frame<S: AsyncWrite + Unpin, T: Serialize>(
     stream: &mut S,
     value: &T,
@@ -193,6 +209,7 @@ type PeerSlots = (Arc<Semaphore>, Arc<Semaphore>);
 struct Limits {
     send: Arc<Semaphore>,
     receive: Arc<Semaphore>,
+    chat_send: Arc<Semaphore>,
     peers: Mutex<BTreeMap<PeerId, PeerSlots>>,
     #[cfg(test)]
     receive_pause: Mutex<Option<ReceivePause>>,
@@ -208,6 +225,7 @@ impl Limits {
         Self {
             send: Arc::new(Semaphore::new(2)),
             receive: Arc::new(Semaphore::new(2)),
+            chat_send: Arc::new(Semaphore::new(1)),
             peers: Mutex::new(BTreeMap::new()),
             #[cfg(test)]
             receive_pause: Mutex::new(None),
@@ -387,6 +405,8 @@ impl Node {
         );
         let mut contacts =
             futures::stream::select(control.accept(CONTACT)?, relay_control.accept(CONTACT)?);
+        let mut chats =
+            futures::stream::select(control.accept(CHAT)?, relay_control.accept(CHAT)?);
         let (dial, mut dials) = mpsc::channel(128);
         let (protocol_reports, mut reports) = mpsc::channel::<ProtocolReport>(128);
         let tasks = TaskTracker::new();
@@ -497,6 +517,12 @@ impl Node {
                         if let Ok(permit) = incoming_slots.clone().try_acquire_owned() {
                             let state = shared.clone();
                             actor_tasks.spawn(async move { let _permit = permit; let _ = serve_contacts(state, peer, stream).await; });
+                        }
+                    },
+                    Some((peer, stream)) = chats.next() => {
+                        if let Ok(permit) = incoming_slots.clone().try_acquire_owned() {
+                            let state = shared.clone();
+                            actor_tasks.spawn(async move { let _permit = permit; let _ = serve_chat(state, peer, stream).await; });
                         }
                     },
                     event = swarm.select_next_some() => match event {
@@ -813,6 +839,104 @@ impl Node {
         let mut stream = self.open_stream(peer, CONTROL).await?;
         write_frame(&mut stream, request).await?;
         read_frame(&mut stream).await
+    }
+
+    /// Accept a message only after it is durable locally. Delivery runs in the
+    /// tracked task set; subsequent network failures are reflected in history.
+    pub async fn send_chat(&self, workspace: Uuid, body: String) -> Result<Uuid> {
+        ensure!(!self.shutdown.is_cancelled(), "Networking is shutting down");
+        let permit = self
+            .limits
+            .chat_send
+            .clone()
+            .try_acquire_owned()
+            .context("Wait for the current chat message to finish sending")?;
+        let (message, targets) = {
+            let mut e = self.shared.lock().await;
+            let snapshot = e.active_snapshot()?;
+            ensure!(
+                snapshot.workspace_id == workspace,
+                "Workspace changed; send again in the intended workspace"
+            );
+            let own_peer = e.peer();
+            let targets = snapshot
+                .members
+                .iter()
+                .filter(|member| {
+                    member.peer_id != own_peer && e.online.contains_key(&member.peer_id)
+                })
+                .map(|member| member.peer_id.parse::<PeerId>())
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let message = e.compose_chat(workspace, body, targets.len())?;
+            (message, targets)
+        };
+        let id = message.id;
+        let node = self.clone();
+        self.tasks.spawn(async move {
+            let _permit = permit;
+            let mut delivered = 0;
+            let mut interrupted = false;
+            let sends = futures::stream::iter(targets.into_iter().map(|peer| {
+                let sender = node.clone();
+                let message = message.clone();
+                async move { sender.send_chat_to(peer, &message).await }
+            }))
+            .buffer_unordered(8);
+            tokio::pin!(sends);
+            loop {
+                tokio::select! {
+                    _ = node.shutdown.cancelled() => {
+                        interrupted = true;
+                        break;
+                    },
+                    result = sends.next() => match result {
+                        Some(Ok(())) => delivered += 1,
+                        Some(Err(_)) => {},
+                        None => break,
+                    },
+                }
+            }
+            let mut e = node.shared.lock().await;
+            if let Err(error) = e.finish_chat(id, delivered, interrupted) {
+                e.error(format!(
+                    "Chat was saved, but its delivery result could not be saved: {error}"
+                ));
+            }
+        });
+        Ok(id)
+    }
+
+    async fn send_chat_to(&self, peer: PeerId, message: &ChatMessage) -> Result<()> {
+        // Check before dialing and again after negotiation: both can yield while
+        // the user switches workspace or a membership update removes a device.
+        self.chat_snapshot(peer, message).await?;
+        let mut stream = self.open_stream(peer, CHAT).await?;
+        let snapshot = self.chat_snapshot(peer, message).await?;
+        write_frame(
+            &mut stream,
+            &ChatRequest {
+                snapshot,
+                message: message.clone(),
+            },
+        )
+        .await?;
+        match read_frame::<_, ChatResponse>(&mut stream).await? {
+            ChatResponse::Stored { message_id } if message_id == message.id => Ok(()),
+            _ => bail!("Chat delivery was not acknowledged"),
+        }
+    }
+
+    async fn chat_snapshot(&self, peer: PeerId, message: &ChatMessage) -> Result<Snapshot> {
+        let e = self.shared.lock().await;
+        let snapshot = e.active_snapshot()?;
+        ensure!(
+            snapshot.workspace_id == message.workspace_id
+                && message.sender_peer_id == e.peer()
+                && snapshot.contains(&message.sender_peer_id)
+                && snapshot.contains(&peer.to_string()),
+            "Chat workspace or membership changed"
+        );
+        Ok(snapshot)
     }
     async fn open_stream(&self, peer: PeerId, protocol: StreamProtocol) -> Result<Stream> {
         let relayed = self
@@ -1289,6 +1413,23 @@ pub async fn serve_control(shared: Shared, peer: PeerId, mut stream: Stream) -> 
     let response = handle_control(shared, peer, request)
         .await
         .unwrap_or(Response::Denied);
+    write_frame(&mut stream, &response).await?;
+    stream.close().await?;
+    Ok(())
+}
+
+async fn serve_chat(shared: Shared, peer: PeerId, mut stream: Stream) -> Result<()> {
+    shared.lock().await.admit_request(&peer.to_string())?;
+    let request: ChatRequest = read_frame(&mut stream).await?;
+    let id = request.message.id;
+    let response = {
+        let mut e = shared.lock().await;
+        match e.receive_chat(&peer.to_string(), &request.snapshot, request.message) {
+            Ok(()) => ChatResponse::Stored { message_id: id },
+            Err(_) => ChatResponse::Denied,
+        }
+    };
+    // Receiving a frame is insufficient: receive_chat must save before this ACK.
     write_frame(&mut stream, &response).await?;
     stream.close().await?;
     Ok(())

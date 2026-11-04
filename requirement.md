@@ -539,7 +539,8 @@ Do not include initially:
 - Central user accounts.
 - Cloud file storage.
 - Web dashboard.
-- Chat.
+- Chat was outside the original MVP. A later local workspace group-chat extension
+  is described in [docs/GROUP_CHAT.md](docs/GROUP_CHAT.md).
 - Comments.
 - File previews.
 - Automatic folder synchronization.

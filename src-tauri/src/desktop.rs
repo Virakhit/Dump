@@ -166,6 +166,18 @@ async fn dispatch(state: tauri::State<'_, Desktop>, action: Action) -> Result<()
     engine::dispatch(&mut *state.shared.lock().await, action).map_err(|e| e.to_string())
 }
 #[tauri::command]
+async fn send_chat_message(
+    state: tauri::State<'_, Desktop>,
+    workspace: Uuid,
+    body: String,
+) -> Result<Uuid, String> {
+    state
+        .node
+        .send_chat(workspace, body)
+        .await
+        .map_err(|error| error.to_string())
+}
+#[tauri::command]
 async fn choose_share_files(
     app: tauri::AppHandle,
     state: tauri::State<'_, Desktop>,
@@ -288,6 +300,7 @@ pub fn run() {
             get_state,
             save_network,
             dispatch,
+            send_chat_message,
             choose_share_files,
             share_dropped_files,
             receive_file,
