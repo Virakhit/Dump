@@ -31,6 +31,7 @@ use tokio_util::sync::CancellationToken;
 pub const PORT: u16 = 42042;
 pub const BANDWIDTH: usize = 2 * 1024 * 1024;
 const BURST: usize = 64 * 1024;
+const REFILL_BATCH: usize = 8 * 1024;
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -134,7 +135,10 @@ impl<S> Throttled<S> {
             bucket.bytes = (bucket.bytes + refill).min(BURST);
             bucket.at = Instant::now();
         }
-        if bucket.bytes != 0 {
+        // Costly framed/encrypted I/O can replenish a few bytes on every poll.
+        // Wait for a useful batch instead of busy-spinning on tiny refills.
+        // Small control writes still wait only for their requested size.
+        if bucket.bytes >= wanted.min(REFILL_BATCH) {
             let grant = wanted.min(bucket.bytes);
             bucket.bytes -= grant;
             *sleep = None;
@@ -448,6 +452,51 @@ mod tests {
                 "duplex progress cancelled the other direction's bandwidth wakeup (read={waiting_for_read})"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn bandwidth_limiter_does_not_fragment_buffered_payload_into_tiny_writes() -> Result<()> {
+        #[derive(Default)]
+        struct CountedWrites(usize);
+        impl AsyncWrite for CountedWrites {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+                bytes: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                self.get_mut().0 += 1;
+                // Framing/encryption has a per-poll cost. Without a useful grant
+                // quantum, even this small cost refills the bucket by a few bytes
+                // and allows write_all to spin without waiting for a useful batch.
+                let until = Instant::now() + Duration::from_micros(10);
+                while Instant::now() < until {
+                    std::hint::spin_loop();
+                }
+                Poll::Ready(Ok(bytes.len()))
+            }
+            fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+            fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+        let mut stream = Throttled {
+            inner: CountedWrites::default(),
+            budget: Arc::new(Mutex::new(Bucket {
+                bytes: BURST,
+                at: Instant::now(),
+            })),
+            read_sleep: None,
+            write_sleep: None,
+        };
+        stream.write_all(&vec![0; 1024 * 1024]).await?;
+        ensure!(
+            stream.inner.0 <= 1024,
+            "A buffered MiB needed {} writes: tiny refills cause excessive polling and CPU use",
+            stream.inner.0
+        );
+        Ok(())
     }
 
     #[tokio::test]

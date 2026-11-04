@@ -894,12 +894,23 @@ impl Engine {
         }
     }
     pub fn mark_transfer(&mut self, id: Uuid, status: &str, bytes: u64, error: Option<String>) {
+        let terminal = ["Completed", "Cancelled", "Failed"].contains(&status);
+        // A disk operation can finish after cancellation. Its late progress
+        // must not erase the reason already recorded by the network actor.
+        if !terminal
+            && self
+                .cancellations
+                .get(&id)
+                .is_some_and(|cancel| cancel.is_cancelled())
+        {
+            return;
+        }
         if let Some(t) = self.transfers.get_mut(&id) {
             t.status = status.into();
             t.bytes = bytes;
             t.error = error;
         }
-        if ["Completed", "Cancelled", "Failed"].contains(&status) {
+        if terminal {
             self.cancellations.remove(&id);
         }
         self.emit();

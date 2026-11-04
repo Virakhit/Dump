@@ -350,6 +350,38 @@ async fn signed_file_receive_commits_after_real_reprobe_without_disconnect() -> 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancelled_receive_progress_keeps_the_network_failure_reason() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let (owner, _, _) = approved_pair(root.path()).await?;
+    let source = root.path().join("cancel-reason.bin");
+    tokio::fs::write(&source, b"payload").await?;
+    share_paths(owner.clone(), vec![source]).await?;
+    let mut e = owner.lock().await;
+    let manifest = e.persisted.shares.values().next().unwrap().manifest.clone();
+    let peer = e.peer();
+    let (id, cancel) = e.register_transfer(&manifest, &peer, "Receiving");
+    // ConnectionClosed cancels and records its reason while holding this lock.
+    cancel.cancel();
+    e.transfers.get_mut(&id).unwrap().error = Some(RELAY_INTERRUPTED.into());
+    // A disk write already in flight may finish after that event.
+    e.mark_transfer(id, "Receiving", 1, None);
+    ensure!(
+        e.transfers[&id].error.as_deref() == Some(RELAY_INTERRUPTED),
+        "Late progress erased the network cancellation reason"
+    );
+    e.mark_transfer(id, "Cancelled", 1, Some(RELAY_INTERRUPTED.into()));
+    ensure!(
+        e.transfers[&id].status == "Cancelled",
+        "Terminal cancellation was suppressed"
+    );
+    ensure!(
+        !e.cancellations.contains_key(&id),
+        "Terminal transfer kept its cancellation slot"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn receive_reports_and_writes_a_partial_block_before_the_sender_continues() -> Result<()> {
     #[derive(NetworkBehaviour)]
     struct Provider {
