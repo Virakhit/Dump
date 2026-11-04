@@ -908,7 +908,7 @@ impl Node {
                             }
                             attempts.insert(*target, (Instant::now(), index + 1));
                         }
-                        e.network_status = if !e.online.is_empty() { if e.online.keys().filter_map(|p| p.parse::<PeerId>().ok()).any(|p| connection_state(&connections, p) == ConnectionState::Direct) { "Connected directly" } else { "Connected via relay" } } else if joining.is_some() || lan_joining.is_some() || desired.iter().any(|p| diagnostic_tx.borrow().get(p).is_some_and(|d| d.state == ConnectionState::Connecting)) { "Connecting…" } else if listeners.is_empty() || !desired.is_empty() { "Offline" } else if discovery { "LAN discovery is running" } else { "Offline" }.into();
+                        e.network_status = if !e.online.is_empty() { if e.online.keys().filter_map(|p| p.parse::<PeerId>().ok()).any(|p| connection_state(&connections, p) == ConnectionState::Direct) { "Connected directly" } else { "Connected via relay" } } else if joining.is_some() || lan_joining.is_some() || desired.iter().any(|p| diagnostic_tx.borrow().get(p).is_some_and(|d| d.state == ConnectionState::Connecting)) { "Connecting." } else if listeners.is_empty() || !desired.is_empty() { "Offline" } else if discovery { "LAN discovery is running" } else { "Offline" }.into();
                         e.emit(); drop(e);
                         for target in targets.into_iter().filter(|p| connection_state(&connections, *p) != ConnectionState::Offline) {
                             let mut ongoing = in_flight.lock().await;
@@ -1508,11 +1508,20 @@ impl Node {
         let mut last = Instant::now();
         while remaining > 0 {
             let wanted = remaining.min(BLOCK as u64) as usize;
+            #[cfg(test)]
+            eprintln!(
+                "file-receive {} before-network offset={total} wanted={wanted} relay={relayed}",
+                manifest.name
+            );
             tokio::select! {
                 _ = cancel.cancelled() => bail!("Transfer cancelled"),
                 read = tokio::time::timeout(INACTIVITY, stream.read_exact(&mut buffer[..wanted])) => read.map_err(anyhow::Error::from).and_then(|r| r.map_err(Into::into)).map_err(|e| relay_error(e, relayed))?,
             };
+            #[cfg(test)]
+            eprintln!("file-receive {} before-disk offset={total}", manifest.name);
             DiskWrite::write_all(&mut file, &buffer[..wanted]).await?;
+            #[cfg(test)]
+            eprintln!("file-receive {} after-disk offset={total}", manifest.name);
             hash.update(&buffer[..wanted]);
             remaining -= wanted as u64;
             total += wanted as u64;
@@ -1936,8 +1945,14 @@ async fn serve_file(
             let mut hash = Sha256::new(); let mut total = 0; let mut buffer = vec![0;BLOCK]; let mut last = Instant::now();
             while total < manifest.size {
                 let wanted = (manifest.size-total).min(BLOCK as u64) as usize;
+                #[cfg(test)]
+                eprintln!("file-send {} before-disk offset={total} wanted={wanted} relay={relayed}", manifest.name);
                 tokio::time::timeout(INACTIVITY,DiskRead::read_exact(&mut file,&mut buffer[..wanted])).await??;
+                #[cfg(test)]
+                eprintln!("file-send {} before-network offset={total}", manifest.name);
                 tokio::time::timeout(INACTIVITY,stream.write_all(&buffer[..wanted])).await.map_err(anyhow::Error::from).and_then(|r| r.map_err(Into::into)).map_err(|e| relay_error(e, relayed))?;
+                #[cfg(test)]
+                eprintln!("file-send {} after-network offset={total}", manifest.name);
                 hash.update(&buffer[..wanted]); total += wanted as u64;
                 if last.elapsed() >= Duration::from_millis(200) {shared.lock().await.mark_transfer(id,"Sharing",total,None); last = Instant::now();}
             }
