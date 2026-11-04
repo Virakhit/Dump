@@ -451,6 +451,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bandwidth_limiter_does_not_fragment_buffered_payload_into_tiny_writes() -> Result<()> {
+        #[derive(Default)]
+        struct CountedWrites(usize);
+        impl AsyncWrite for CountedWrites {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+                bytes: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                self.get_mut().0 += 1;
+                Poll::Ready(Ok(bytes.len()))
+            }
+            fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+            fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+        let mut stream = Throttled {
+            inner: CountedWrites::default(),
+            budget: Arc::new(Mutex::new(Bucket {
+                bytes: BURST,
+                at: Instant::now(),
+            })),
+            read_sleep: None,
+            write_sleep: None,
+        };
+        stream.write_all(&vec![0; 1024 * 1024]).await?;
+        ensure!(
+            stream.inner.0 <= 1024,
+            "A buffered MiB needed {} writes: tiny refills cause excessive polling and CPU use",
+            stream.inner.0
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn shared_bandwidth_and_connection_rate_are_bounded() -> Result<()> {
         let budget = Arc::new(Mutex::new(Bucket {
             bytes: BURST,

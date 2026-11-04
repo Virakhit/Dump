@@ -1373,7 +1373,17 @@ impl Node {
                 .get(&file_id)
                 .context("File is no longer available")?
                 .clone();
+            // Keep the pending route if a disconnect cancels this worker before
+            // it acquires a receive slot. receive_inner refreshes the actual route.
+            let relayed = self
+                .diagnostics
+                .borrow()
+                .get(&manifest.owner_peer_id.parse::<PeerId>()?)
+                .is_some_and(|d| d.state == ConnectionState::Relay);
             let (id, cancel) = e.register_transfer(&manifest, &manifest.owner_peer_id, "Receiving");
+            if let Some(transfer) = e.transfers.get_mut(&id) {
+                transfer.relayed = relayed;
+            }
             (manifest, id, cancel)
         };
         let node = self.clone();
