@@ -370,6 +370,69 @@ pub(crate) fn start(
 mod tests {
     use super::*;
     use futures::AsyncWriteExt;
+
+    #[tokio::test]
+    async fn duplex_progress_preserves_the_other_directions_bandwidth_wakeup() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::task::{Wake, Waker};
+
+        #[derive(Default)]
+        struct Woken(AtomicBool);
+        impl Wake for Woken {
+            fn wake(self: Arc<Self>) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        for waiting_for_read in [true, false] {
+            let budget = Arc::new(Mutex::new(Bucket {
+                bytes: 0,
+                // Freeze refill so only the simulated refund below grants bytes.
+                at: Instant::now() + Duration::from_secs(60),
+            }));
+            let mut stream = Throttled {
+                inner: futures::io::Cursor::new(vec![42; 4]),
+                budget: budget.clone(),
+                sleep: None,
+            };
+            let woke = Arc::new(Woken::default());
+            let waker = Waker::from(woke.clone());
+            let mut cx = Context::from_waker(&waker);
+            let mut byte = [0];
+
+            if waiting_for_read {
+                assert!(Pin::new(&mut stream)
+                    .poll_read(&mut cx, &mut byte)
+                    .is_pending());
+            } else {
+                assert!(Pin::new(&mut stream)
+                    .poll_write(&mut cx, &[7])
+                    .is_pending());
+            }
+            // Another stream can refund its unused grant into the shared bucket.
+            budget.lock().unwrap().bytes = 1;
+            if waiting_for_read {
+                assert!(matches!(
+                    Pin::new(&mut stream).poll_write(&mut cx, &[7]),
+                    Poll::Ready(Ok(1))
+                ));
+            } else {
+                assert!(matches!(
+                    Pin::new(&mut stream).poll_read(&mut cx, &mut byte),
+                    Poll::Ready(Ok(1))
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(
+                woke.0.load(Ordering::SeqCst),
+                "duplex progress cancelled the other direction's bandwidth wakeup (read={waiting_for_read})"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn shared_bandwidth_and_connection_rate_are_bounded() -> Result<()> {
         let budget = Arc::new(Mutex::new(Bucket {
