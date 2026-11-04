@@ -3,15 +3,15 @@
 A Windows desktop app for sharing files directly with trusted people on the same local network.
 Files stay on the owner's device until another member receives them. No account, cloud file storage, or Dump backend is required.
 
-**Status:** v0.1.1 alpha. The initial target is Windows 11 x64 and small groups of friends or teammates. See [verification results](docs/VERIFICATION.md) for tested behavior and outstanding release checks.
+**Status:** v0.1.2-alpha.1. The initial target is Windows 11 x64 and small groups of friends or teammates. See [verification results](docs/VERIFICATION.md) for tested behavior and outstanding release checks.
 
 ## Install on Windows
 
-**[Download the Windows installer](https://github.com/Virakhit/Dump/releases/download/v0.1.1-alpha.2/Dump_0.1.1_x64-setup.exe)** — Windows x64.
+**[Download the Windows installer](https://github.com/Virakhit/Dump/releases/download/v0.1.2-alpha.1/Dump_0.1.2_x64-setup.exe)** — Windows x64.
 
-[Release notes and updater signature](https://github.com/Virakhit/Dump/releases/tag/v0.1.1-alpha.2). Download the `.exe` installer from the release assets; the source-code ZIP is for developers.
+[Release notes and updater signature](https://github.com/Virakhit/Dump/releases/tag/v0.1.2-alpha.1). Download the `.exe` installer from the release assets; the source-code ZIP is for developers.
 
-1. Download and run `Dump_0.1.1_x64-setup.exe` on each Windows device.
+1. Download and run `Dump_0.1.2_x64-setup.exe` on each Windows device.
 2. Click **Next**, choose an installation folder, and click **Install**. Dump installs for the current Windows user.
 3. On the final wizard screen, leave **Run Dump** selected and click **Finish**.
 4. Later, open **Dump** from the Windows Start Menu or the desktop shortcut if you chose to create one.
