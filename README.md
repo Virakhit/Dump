@@ -40,6 +40,26 @@ The owner must be online with the relevant workspace selected to approve joins. 
 
 Sharing does not duplicate the original file. Files being hashed or served are temporarily opened read-only with write/delete sharing disabled. Changed files receive a new signed manifest; unavailable files disappear from the active catalog. Empty files and files larger than 4 GiB use the same streaming path.
 
+## Group chat (source build)
+
+Each workspace now has a **Group chat** tab. Run this source build on each
+Windows device, join and approve members as usual, then select the same workspace
+on the same LAN. Type a message and press **Enter** or **Send**; **Shift+Enter**
+adds a new line. No chat server or Internet account is needed.
+
+Messages are sent to approved devices known online at send time. Delivery counts
+mean the receiving device saved the message; they are not read receipts. Offline
+devices do not receive missed messages, and history is not synchronized when a
+device rejoins. Older Dump builds can still share files, but cannot receive chat.
+
+History stays on each device in the existing Windows-protected local state. The
+latest 500 messages per workspace are retained, with a device-wide cap of 2,000.
+Messages support multiline Unicode text up to 4,096 UTF-8 bytes. The workspace
+owner can be offline after membership approval. See the [group chat guide](docs/GROUP_CHAT.md)
+for local setup, delivery states, and a multi-device check.
+
+The published installer above does not include this source-only feature.
+
 ## Privacy and limits
 
 - QUIC authenticates device keys and encrypts traffic; workspace membership is checked separately on every request.

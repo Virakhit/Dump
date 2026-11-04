@@ -8,6 +8,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+const MAX_STATE_BYTES: usize = 32 * 1024 * 1024;
+
 pub struct Store {
     path: PathBuf,
 }
@@ -25,7 +27,7 @@ impl Store {
             return Ok(state);
         }
         let bytes = fs::read(&self.path)?;
-        ensure!(bytes.len() <= 32 * 1024 * 1024, "Local state is too large");
+        ensure!(bytes.len() <= MAX_STATE_BYTES, "Local state is too large");
         let mut state: Persisted = serde_json::from_slice(&unprotect(&bytes)?)
             .context("Cannot read protected state; original data has been preserved")?;
         ensure!(state.version == VERSION, "Unsupported local state version");
@@ -34,6 +36,14 @@ impl Store {
         for workspace in state.workspaces.values() {
             workspace.snapshot.verify()?;
         }
+        crate::chat::validate_history(&state.chat_messages, &state.peer_id()?)?;
+        ensure!(
+            state
+                .chat_messages
+                .iter()
+                .all(|entry| state.workspaces.contains_key(&entry.message.workspace_id)),
+            "Chat history refers to an unknown workspace"
+        );
         let migrated = state.relay_identity.is_empty();
         if migrated {
             state.relay_identity = B64.encode(Keypair::generate_ed25519().to_protobuf_encoding()?);
@@ -53,7 +63,12 @@ impl Store {
         Ok(state)
     }
     pub fn save(&self, state: &Persisted) -> Result<()> {
-        let bytes = protect(&serde_json::to_vec(state)?)?;
+        let plain = serde_json::to_vec(state)?;
+        ensure!(plain.len() <= MAX_STATE_BYTES, "Local state is too large");
+        let bytes = protect(&plain)?;
+        // Reject an oversized write before touching the previous state: a file
+        // accepted here must also fit the bound enforced when it is reopened.
+        ensure!(bytes.len() <= MAX_STATE_BYTES, "Local state is too large");
         let temporary = self.path.with_extension("new");
         let mut file = fs::OpenOptions::new()
             .write(true)

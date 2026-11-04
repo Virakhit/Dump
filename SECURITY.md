@@ -57,6 +57,24 @@ Stage 6 adds short-lived Ed25519-signed public-IP routing hints through private 
 
 An unreachable or malicious endpoint may still cause delays or denial of service. Dial attempts, frame sizes/timeouts, connection counts, cached contacts and DCUtR negotiations are bounded. The normal app entry point always rejects loopback Internet contacts; isolated unit simulations enable a private test-only route exception. Local tests prove protocol/authentication/integrity behavior, including deliberately incorrect bytes from an approved provider and rejection of nonmember contact requests. They do not prove real NAT traversal or packet-capture confidentiality. No accounts, central directory, public workspace discovery or telemetry are introduced.
 
+## Local workspace chat
+
+The source-only `/dump/chat/1` extension uses the same authenticated and encrypted
+end-peer transport as workspace sharing. Every message is bound to its workspace
+and sender by a device signature; transport identity must equal the author.
+Current locally known owner-signed membership and the active workspace are checked
+before accepting it. Display names do not authorize messages. Revocation has the
+same propagation limits as file access, and already received history cannot be
+recalled.
+
+Chat bodies are bounded plain text and rendered without HTML interpretation. Frames,
+incoming tasks, request rates and outgoing fan-out are bounded. Local history is
+stored in the existing user-scoped Windows DPAPI state and retained within explicit
+per-workspace and per-device limits. Acknowledgments follow persistence. History is
+never offered for peer synchronization; offline delivery, read receipts, and backup
+or recovery are not provided. Duplicate detection covers retained history, not an
+unbounded record of every message ever seen.
+
 ## Reporting
 
 Report suspected vulnerabilities privately through [GitHub security advisories](https://github.com/Virakhit/Dump/security/advisories/new). Private vulnerability reporting is enabled for this repository. Do not publish real invite tokens, private keys, workspace secrets, user files, local paths, or personal network captures in an issue or report.

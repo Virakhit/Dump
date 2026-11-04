@@ -6,13 +6,37 @@ Each installation keeps its original libp2p Ed25519 device/member identity and a
 
 Every workspace pins its creator's Peer ID and public key. Only that identity signs membership revisions. A workspace ID can never be rebound to a different creator through a join link or network message. The latest locally persisted signed roster determines access; a shared workspace secret alone grants no access. Workspace secrets are supplementary protected state in v0.1 and are not group-wide passwords or independent encryption keys.
 
+## Workspace chat extension
+
+`/dump/chat/1` is a separate request/acknowledgment protocol on the existing
+authenticated device transport. A request carries the owner-signed membership
+snapshot and a sender-signed message bound to its UUID, workspace, author key,
+display name, body and timestamp. The authenticated remote peer must match the
+author, both devices must be current members, and the recipient must have the
+workspace selected. Older clients can continue file sharing without supporting
+this protocol.
+
+The recipient saves to protected local state before acknowledging the message ID.
+An identical stored message is acknowledged without another append; a conflicting
+ID is rejected. Requests use the existing bounded CBOR framing, request-rate budget,
+timeouts and shared inbound control-stream ceiling. A device sends one chat message
+at a time, with at most eight recipient streams in parallel. Delivery status counts
+durable device acknowledgments and never implies a human read receipt.
+
+Messages are plain UTF-8 text, bounded to 4,096 bytes. History retains at most 500
+messages per workspace and 2,000 per device. Local arrival order determines retention;
+sender timestamps do not control ordering or authorization. History is not relayed
+or synchronized, offline recipients are not queued, and switching workspaces does
+not redirect an in-flight send. See [GROUP_CHAT.md](GROUP_CHAT.md) for user-visible
+limits and manual acceptance checks.
+
 ## Discovery
 
 libp2p mDNS advertises multiaddresses and Peer IDs. No invitation codes, workspace IDs, names, member lists, filenames, or hashes are put into discovery records. There is no DHT, rendezvous backend or public user list. The current core has an explicitly configured circuit relay client (Stage 3), with no default infrastructure; the opt-in host role is described below. Local observers can nevertheless correlate running devices and IPs.
 
 The v0.2 Stage 1 core adds Identify and explicit literal-IP QUIC dialing. Identify exposes the device public key, protocol/agent versions, supported transport protocols and the address at which the remote peer was observed. It hides this device's interface listen addresses, and its automatic peer-address cache is disabled. LAN discovery remains independent. Public addresses learned from already known peers are bounded hints, never authorization. Observed public addresses are recorded in local diagnostics only: a peer's report is not evidence that a NAT permits inbound connections. No observed address is promoted to a confirmed external address or advertised in this stage.
 
-Direct addresses must be exactly `/ip4/<IP>/udp/<port>/quic-v1` or `/ip6/<IP>/udp/<port>/quic-v1`, optionally followed by the expected `/p2p/<PeerID>`. Ports must be nonzero; unspecified, multicast and broadcast destinations are rejected. A conflicting suffix is rejected before dialing; the QUIC handshake checks the expected identity even without a suffix. Explicit local callers can dial LAN/loopback addresses. Remote Identify hints exclude private, shared/CGNAT, loopback, link-local, documentation and other reserved address ranges. Address records are capped at 256 peers and eight addresses per peer. `Node::connect` acknowledges registration with the actor, not a successful connection; its bounded diagnostic watch distinguishes connecting, direct, offline and dial failure. Raw addresses are exposed only in advanced network settings, outside normal sharing UI. UI connectivity reflects successful authorized catalog exchanges, rather than an outsider's transport connection.
+Direct addresses must be exactly `/ip4/<IP>/udp/<port>/quic-v1` or `/ip6/<IP>/udp/<port>/quic-v1`, optionally followed by the expected `/p2p/<PeerID>`. Ports must be nonzero; unspecified, multicast and broadcast destinations are rejected. A conflicting suffix is rejected before dialing; the QUIC handshake checks the expected identity even without a suffix. Explicit local callers can dial LAN/loopback addresses. Remote Identify hints exclude private, shared/CGNAT, loopback, link-local, documentation and other reserved address ranges. Address records are capped at 256 peers and eight addresses per peer. `Node::connect` acknowledges registration with the actor, not a successful connection; its bounded diagnostic watch distinguishes connecting, direct, offline and dial failure. Raw addresses are exposed only in advanced network settings, outside normal sharing UI. UI connectivity reflects successful authorized workspace exchanges, rather than an outsider's transport connection.
 
 Stage 2 adds an AutoNAT v2 client. Only validated global IP/QUIC or IP/TCP candidates are submitted; local/private addresses are never sent to an AutoNAT server. Successful confirmation requires an inbound authenticated dial-back bound to the candidate, pending nonce and request connection, not only a server's success response. The library then advertises the confirmed external address through Identify; Dump retains it for at most ten minutes and removes it when the confirming server disconnects. Results describe specific routes from that server, not universal Internet reachability, trustworthy infrastructure or membership. `Unknown` means no current confirmation (including no usable server or inconclusive timeout); `Public` means at least one current confirmed address; `Unreachable` means the reported test failed and no confirmed address remains, not proof that every possible NAT route is impossible.
 

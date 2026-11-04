@@ -1,5 +1,5 @@
 #![cfg(windows)]
-use anyhow::{ensure, Result};
+use anyhow::{ensure, Context, Result};
 use dump_core::{
     engine::{refresh_share, share_paths, Engine, Shared, View},
     model::*,
@@ -149,7 +149,28 @@ async fn authenticated_quic_file_loop_and_revocation() -> Result<()> {
     .await?;
     assert!(!cancelled_dir.join(&manifest.name).exists());
     // Source edits cannot be accepted under an old manifest, including edits of equal size.
-    std::fs::write(&source, vec![7u8; payload.len()])?;
+    // Receiver cancellation does not join the sender's task. Its read handle
+    // denies writes until that task unwinds, so wait for actual write access.
+    let mut edited_source = tokio::time::timeout(Duration::from_secs(20), async {
+        let mut retry = tokio::time::interval(Duration::from_millis(25));
+        loop {
+            match std::fs::OpenOptions::new().write(true).open(&source) {
+                Ok(file) => return Ok::<_, anyhow::Error>(file),
+                Err(error) if error.raw_os_error() == Some(32) => {
+                    retry.tick().await;
+                }
+                Err(error) => {
+                    return Err(error)
+                        .context("source edit: cannot open original file for writing");
+                }
+            }
+        }
+    })
+    .await
+    .context("source edit: sender did not release its Windows read handle")??;
+    std::io::Write::write_all(&mut edited_source, &vec![7u8; payload.len()])
+        .context("source edit: cannot replace original bytes")?;
+    drop(edited_source);
     let changed_dir = root.path().join("changed");
     std::fs::create_dir(&changed_dir)?;
     let changed = nc.receive(manifest.file_id, changed_dir.clone()).await?;

@@ -1,3 +1,4 @@
+pub mod chat;
 pub mod connectivity;
 pub mod contact;
 #[cfg(feature = "desktop")]

@@ -18,10 +18,21 @@ jobs:
       - run: npm ci
       - run: npm run build
       - run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
+      - run: cargo test --manifest-path src-tauri/Cargo.toml --locked --test chat
       - run: cargo test --manifest-path src-tauri/Cargo.toml --no-default-features --locked
-      - run: cargo test --manifest-path src-tauri/Cargo.toml --locked -p libp2p-stream --lib
-      - run: cargo test --manifest-path src-tauri/Cargo.toml --locked -p libp2p-autonat --lib
-      - run: cargo test --manifest-path src-tauri/Cargo.toml --features updater-tests --test updater --locked
-      - run: cargo test --manifest-path src-tauri/Cargo.toml --lib --locked
-      - run: node --test scripts/publish-update.test.cjs
-      - run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked -- -D warnings
+      # Keep independent checks visible after a failing test. Any failure still
+      # fails the job; no check is ignored or retried to obtain a green result.
+      - if: ${{ !cancelled() }}
+        run: cargo test --manifest-path src-tauri/Cargo.toml --no-default-features --locked --test lan
+      - if: ${{ !cancelled() }}
+        run: cargo test --manifest-path src-tauri/Cargo.toml --locked -p libp2p-stream --lib
+      - if: ${{ !cancelled() }}
+        run: cargo test --manifest-path src-tauri/Cargo.toml --locked -p libp2p-autonat --lib
+      - if: ${{ !cancelled() }}
+        run: cargo test --manifest-path src-tauri/Cargo.toml --features updater-tests --test updater --locked
+      - if: ${{ !cancelled() }}
+        run: cargo test --manifest-path src-tauri/Cargo.toml --lib --locked
+      - if: ${{ !cancelled() }}
+        run: node --test scripts/publish-update.test.cjs
+      - if: ${{ !cancelled() }}
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked -- -D warnings

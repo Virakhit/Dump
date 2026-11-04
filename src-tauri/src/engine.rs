@@ -1,4 +1,5 @@
 use crate::{
+    chat::{trim_history, ChatDelivery, ChatDeliveryStatus, ChatMessage, StoredChat},
     lan_invite::{self, LanInvite, LanJoin},
     model::*,
     storage::Store,
@@ -68,6 +69,7 @@ pub struct View {
     pub workspaces: Vec<WorkspaceView>,
     pub online: Vec<String>,
     pub files: Vec<FileView>,
+    pub chat_messages: Vec<StoredChat>,
     pub pending: Vec<Pending>,
     pub preparing: Vec<String>,
     pub joining: bool,
@@ -103,6 +105,13 @@ impl Engine {
     pub fn open(directory: &Path, notify: Notify) -> Result<Shared> {
         let store = Store::new(directory)?;
         let mut persisted = store.load()?;
+        for entry in &mut persisted.chat_messages {
+            if let Some(delivery) = &mut entry.delivery {
+                if delivery.status == ChatDeliveryStatus::Sending {
+                    delivery.status = ChatDeliveryStatus::Interrupted;
+                }
+            }
+        }
         let mut cleanup_failed = false;
         persisted.partials.retain(|partial| {
             // Only recorded, UUID-named Dump partials are eligible for startup cleanup.
@@ -225,6 +234,13 @@ impl Engine {
                 .collect(),
             online: self.online.keys().cloned().collect(),
             files,
+            chat_messages: self
+                .persisted
+                .chat_messages
+                .iter()
+                .filter(|entry| Some(entry.message.workspace_id) == self.persisted.active)
+                .cloned()
+                .collect(),
             pending: self
                 .pending
                 .values()
@@ -241,6 +257,120 @@ impl Engine {
             network: self.persisted.network.clone(),
         }
     }
+    pub fn compose_chat(
+        &mut self,
+        workspace: Uuid,
+        body: String,
+        attempted: usize,
+    ) -> Result<ChatMessage> {
+        let snapshot = self.active_snapshot()?;
+        ensure!(
+            snapshot.workspace_id == workspace,
+            "Workspace changed; send again in the intended workspace"
+        );
+        ensure!(snapshot.contains(&self.peer()), "Access denied");
+        ensure!(
+            attempted < snapshot.members.len(),
+            "Invalid chat recipient count"
+        );
+        let message = ChatMessage::new(
+            workspace,
+            self.persisted.device_name.clone(),
+            body,
+            &self.key,
+        )?;
+        let mut next = self.persisted.clone();
+        next.chat_messages.push(StoredChat {
+            message: message.clone(),
+            delivery: Some(ChatDelivery {
+                attempted,
+                delivered: 0,
+                status: ChatDeliveryStatus::Sending,
+            }),
+        });
+        trim_history(&mut next.chat_messages);
+        self.persist(next)?;
+        self.emit();
+        Ok(message)
+    }
+
+    pub fn receive_chat(
+        &mut self,
+        peer: &str,
+        snapshot: &Snapshot,
+        message: ChatMessage,
+    ) -> Result<()> {
+        message.verify()?;
+        ensure!(
+            message.sender_peer_id == peer && message.workspace_id == snapshot.workspace_id,
+            "Chat does not belong to the authenticated sender or workspace"
+        );
+        self.authorize(peer, snapshot)?;
+        if let Some(existing) = self
+            .persisted
+            .chat_messages
+            .iter()
+            .find(|entry| entry.message.id == message.id)
+        {
+            ensure!(existing.message == message, "Conflicting chat message ID");
+            // An identical message has already passed the durable save below.
+            return Ok(());
+        }
+        let mut next = self.persisted.clone();
+        next.chat_messages.push(StoredChat {
+            message,
+            delivery: None,
+        });
+        trim_history(&mut next.chat_messages);
+        self.persist(next)?;
+        self.online.insert(peer.into(), now());
+        self.emit();
+        Ok(())
+    }
+
+    pub fn finish_chat(&mut self, id: Uuid, delivered: usize, interrupted: bool) -> Result<()> {
+        let Some(index) = self
+            .persisted
+            .chat_messages
+            .iter()
+            .position(|entry| entry.message.id == id)
+        else {
+            // Retention may remove an old entry while its network task finishes.
+            return Ok(());
+        };
+        let entry = &self.persisted.chat_messages[index];
+        ensure!(
+            entry.message.sender_peer_id == self.peer(),
+            "Not a sent chat message"
+        );
+        let delivery = entry.delivery.as_ref().context("Not a sent chat message")?;
+        ensure!(
+            delivered <= delivery.attempted,
+            "Invalid chat delivery count"
+        );
+        let status = if interrupted {
+            ChatDeliveryStatus::Interrupted
+        } else {
+            ChatDeliveryStatus::Complete
+        };
+        if delivery.status != ChatDeliveryStatus::Sending {
+            ensure!(
+                delivery.status == status && delivery.delivered == delivered,
+                "Chat delivery has already finished"
+            );
+            return Ok(());
+        }
+        let mut next = self.persisted.clone();
+        let delivery = next.chat_messages[index].delivery.as_mut().unwrap();
+        delivery.delivered = delivered;
+        delivery.status = status;
+        self.persist(next)?;
+        // Resolve by message ID in stored history, even if a different room is
+        // active now. view() continues to expose only that active room.
+        self.emit();
+        Ok(())
+    }
+
     pub fn create_workspace(&mut self, name: String) -> Result<()> {
         validate_label(&name)?;
         let peer = self.peer();
