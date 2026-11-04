@@ -350,6 +350,147 @@ async fn signed_file_receive_commits_after_real_reprobe_without_disconnect() -> 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn receive_reports_and_writes_a_partial_block_before_the_sender_continues() -> Result<()> {
+    #[derive(NetworkBehaviour)]
+    struct Provider {
+        streams: libp2p_stream::Behaviour,
+    }
+
+    const PREFIX: usize = 4096;
+    let root = tempfile::tempdir()?;
+    let (owner, member, mut events) = approved_pair(root.path()).await?;
+    let payload = vec![53; BLOCK + 17];
+    let source = root.path().join("partial-block.bin");
+    tokio::fs::write(&source, &payload).await?;
+    share_paths(owner.clone(), vec![source]).await?;
+    let manifest = owner
+        .lock()
+        .await
+        .persisted
+        .shares
+        .values()
+        .next()
+        .unwrap()
+        .manifest
+        .clone();
+    let key = owner.lock().await.key.clone();
+    let owner_peer = key.public().to_peer_id();
+    let mut provider = SwarmBuilder::with_existing_identity(key)
+        .with_tokio()
+        .with_quic()
+        .with_behaviour(|_| Provider {
+            streams: libp2p_stream::Behaviour::new(),
+        })?
+        .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
+        .build();
+    provider.listen_on("/ip4/127.0.0.1/udp/0/quic-v1".parse()?)?;
+    let address = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let SwarmEvent::NewListenAddr { address, .. } = provider.select_next_some().await {
+                break address;
+            }
+        }
+    })
+    .await?;
+    let mut files = provider.behaviour().streams.new_control().accept(FILE)?;
+    let b = Node::start(member.clone(), false).await?;
+    let session = Session(vec![b.clone()]);
+    let (sent, prefix_sent) = oneshot::channel();
+    let (resume, resumed) = oneshot::channel();
+    let stop = CancellationToken::new();
+    let task_stop = stop.clone();
+    let served_manifest = manifest.clone();
+    let served_payload = payload.clone();
+    let host = tokio::spawn(async move {
+        let mut gates = Some((sent, resumed));
+        loop {
+            tokio::select! {
+                _ = task_stop.cancelled() => break,
+                _ = provider.select_next_some() => {},
+                Some((_, mut stream)) = files.next() => {
+                    let (sent, resumed) = gates.take().context("Unexpected second file request")?;
+                    tokio::select! {
+                        _ = task_stop.cancelled() => break,
+                        result = async {
+                            ensure!(matches!(read_frame::<_, Request>(&mut stream).await?, Request::File { .. }), "Expected file request");
+                            write_frame(&mut stream, &Response::File { manifest: served_manifest.clone() }).await?;
+                            stream.write_all(&served_payload[..PREFIX]).await?;
+                            stream.flush().await?;
+                            let _ = sent.send(());
+                            resumed.await?;
+                            stream.write_all(&served_payload[PREFIX..]).await?;
+                            write_frame(&mut stream, &Response::Done).await?;
+                            stream.close().await?;
+                            Ok::<_, anyhow::Error>(())
+                        } => result?,
+                    }
+                }
+            }
+        }
+        Ok::<_, anyhow::Error>(())
+    });
+    let result = async {
+        b.connect(owner_peer, address).await?;
+        connection(&b, owner_peer, ConnectionState::Direct).await?;
+        member
+            .lock()
+            .await
+            .remote
+            .insert(manifest.file_id, manifest.clone());
+        let output = root.path().join("received");
+        tokio::fs::create_dir(&output).await?;
+        let id = b.receive(manifest.file_id, output.clone()).await?;
+        tokio::time::timeout(Duration::from_secs(5), prefix_sent).await??;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let e = member.lock().await;
+                let transfer = &e.transfers[&id];
+                if transfer.bytes > 0 && transfer.bytes < BLOCK as u64 {
+                    ensure!(
+                        transfer.status == "Receiving",
+                        "Partial block was not receiving"
+                    );
+                    break Ok::<_, anyhow::Error>(());
+                }
+                drop(e);
+                events.changed().await?;
+            }
+        })
+        .await
+        .context("Partial payload was hidden until a complete block arrived")??;
+        let part = output.join(format!(".dump-{id}.part"));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if tokio::fs::read(&part).await?.as_slice() == &payload[..PREFIX] {
+                    break Ok::<_, anyhow::Error>(());
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .context("Partial payload was not written before the sender continued")??;
+        ensure!(
+            !output.join(&manifest.name).exists(),
+            "Partial file was committed"
+        );
+        resume
+            .send(())
+            .map_err(|_| anyhow::anyhow!("Provider stopped before resume"))?;
+        finished(&b, &mut events, id, true).await?;
+        committed(&b, &manifest, &payload, &output).await?;
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    stop.cancel();
+    let cleanup = session.close().await;
+    let host_result = tokio::time::timeout(Duration::from_secs(5), host).await;
+    result?;
+    cleanup?;
+    host_result???;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn active_relay_file_keeps_its_route_when_new_requests_upgrade_to_direct() -> Result<()> {
     let root = tempfile::tempdir()?;
     let (owner, member, mut events) = approved_pair(root.path()).await?;
