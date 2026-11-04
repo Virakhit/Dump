@@ -1991,6 +1991,13 @@ async fn serve_file(
 mod lan_invite_tests;
 
 #[cfg(all(test, windows))]
+pub(crate) async fn occupy_receive_slots_for_test(
+    node: &Node,
+) -> Result<tokio::sync::OwnedSemaphorePermit> {
+    Ok(node.limits.receive.clone().acquire_many_owned(2).await?)
+}
+
+#[cfg(all(test, windows))]
 #[path = "network_identity_tests.rs"]
 mod identity_tests;
 
