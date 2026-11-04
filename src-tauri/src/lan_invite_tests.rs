@@ -52,6 +52,7 @@ pub(crate) fn engine(directory: &Path) -> Result<Engine> {
         notify: Arc::new(|_| {}),
         lan_invites: BTreeMap::new(),
         lan_joining: None,
+        join_request_submitted: false,
     })
 }
 
@@ -116,6 +117,19 @@ fn lan_join_can_be_cancelled_and_expires_without_saved_state() -> Result<()> {
     assert!(member.last_error.is_none());
     member.reset_runtime();
     assert!(!member.view().joining);
+    Ok(())
+}
+
+#[test]
+fn joining_view_does_not_claim_the_owner_has_received_a_request() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let mut owner = engine(&root.path().join("owner"))?;
+    let mut member = engine(&root.path().join("member"))?;
+    member.join(&owner.create_lan_invite()?)?;
+    let view = serde_json::to_value(member.view())?;
+    assert_eq!(view["join_stage"], "finding_owner");
+    member.cancel_join()?;
+    assert!(serde_json::to_value(member.view())?["join_stage"].is_null());
     Ok(())
 }
 

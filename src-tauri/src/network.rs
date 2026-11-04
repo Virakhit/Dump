@@ -1259,6 +1259,7 @@ impl Node {
             let e = self.shared.lock().await;
             prepare_lan_request(&e, peer, code, deadline)?
         };
+        let submitted_name = request.name.is_some();
         let mut control = self.lan_control.clone();
         let response = tokio::time::timeout(PREAUTH_TIMEOUT, async {
             let mut stream = control.open_stream(peer, LAN_INVITE).await?;
@@ -1267,7 +1268,21 @@ impl Node {
         })
         .await??;
         let mut e = self.shared.lock().await;
-        apply_lan_response(&mut e, peer, code, deadline, response)
+        apply_lan_response(&mut e, peer, code, deadline, response)?;
+        // A code-only ownership probe deliberately creates no approval request.
+        // Show "awaiting approval" only after the authenticated owner has
+        // acknowledged the subsequent request that includes this device's name.
+        if submitted_name
+            && e.lan_joining.as_ref().is_some_and(|join| {
+                join.code == code
+                    && join.expires_at == deadline
+                    && join.owner_peer_id.as_deref() == Some(peer.to_string().as_str())
+            })
+        {
+            e.join_request_submitted = true;
+            e.emit();
+        }
+        Ok(())
     }
     async fn poll_join(&self, invitation: Invitation) -> Result<()> {
         let peer = invitation.owner_peer_id.parse()?;
@@ -1334,7 +1349,17 @@ impl Node {
                     e.error("Invitation was rejected, expired, or already used. Ask the owner for a new invite.");
                 }
             }
-            Response::Waiting => {}
+            Response::Waiting => {
+                let mut e = self.shared.lock().await;
+                if e.persisted.joining.as_ref().is_some_and(|current| {
+                    current.token == invitation.token
+                        && current.workspace_id == invitation.workspace_id
+                        && current.owner_peer_id == invitation.owner_peer_id
+                }) {
+                    e.join_request_submitted = true;
+                    e.emit();
+                }
+            }
             _ => bail!("Invalid join response"),
         }
         Ok(())

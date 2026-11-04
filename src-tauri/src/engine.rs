@@ -73,6 +73,7 @@ pub struct View {
     pub pending: Vec<Pending>,
     pub preparing: Vec<String>,
     pub joining: bool,
+    pub join_stage: Option<&'static str>,
     pub network_status: String,
     pub relay_peers: Vec<String>,
     pub transfers: Vec<Transfer>,
@@ -100,6 +101,7 @@ pub struct Engine {
     pub notify: Notify,
     pub(crate) lan_invites: BTreeMap<String, LanInvite>,
     pub(crate) lan_joining: Option<LanJoin>,
+    pub(crate) join_request_submitted: bool,
 }
 impl Engine {
     pub fn open(directory: &Path, notify: Notify) -> Result<Shared> {
@@ -149,6 +151,7 @@ impl Engine {
             notify,
             lan_invites: BTreeMap::new(),
             lan_joining: None,
+            join_request_submitted: false,
         })))
     }
     pub fn peer(&self) -> String {
@@ -249,6 +252,19 @@ impl Engine {
                 .collect(),
             preparing: self.preparing.clone(),
             joining: self.persisted.joining.is_some() || self.lan_joining.is_some(),
+            join_stage: if self.persisted.joining.is_none() && self.lan_joining.is_none() {
+                None
+            } else if self.join_request_submitted {
+                Some("awaiting_approval")
+            } else if let Some(join) = &self.lan_joining {
+                Some(if join.owner_peer_id.is_some() {
+                    "requesting_approval"
+                } else {
+                    "finding_owner"
+                })
+            } else {
+                Some("contacting_owner")
+            },
             network_status: self.network_status.clone(),
             relay_peers: self.relay_peers.clone(),
             transfers: self.transfers.values().cloned().collect(),
@@ -441,6 +457,7 @@ impl Engine {
         });
         self.lan_invites.clear();
         self.lan_joining = None;
+        self.join_request_submitted = false;
     }
     pub fn create_lan_invite(&mut self) -> Result<String> {
         let snapshot = self.active_snapshot()?;
@@ -643,6 +660,7 @@ impl Engine {
                 expires_at: now().saturating_add(lan_invite::LIFETIME),
                 owner_peer_id: None,
             });
+            self.join_request_submitted = false;
             self.last_error = None;
             self.emit();
             return Ok(());
@@ -662,6 +680,7 @@ impl Engine {
         next.joining = Some(invite);
         self.persist(next)?;
         self.lan_joining = None;
+        self.join_request_submitted = false;
         self.emit();
         Ok(())
     }
@@ -672,6 +691,7 @@ impl Engine {
             self.persist(next)?;
         }
         self.lan_joining = None;
+        self.join_request_submitted = false;
         self.emit();
         Ok(())
     }

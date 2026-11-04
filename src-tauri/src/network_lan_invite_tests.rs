@@ -148,6 +148,7 @@ fn lan_lookup_sends_a_device_name_only_after_authenticating_that_exact_owner() -
         .to_peer_id();
     member.join(&url)?;
     let deadline = member.lan_joining.as_ref().unwrap().expires_at;
+    assert_eq!(member.view().join_stage, Some("finding_owner"));
 
     for target in [unrelated_peer, owner_peer] {
         let probe = prepare_lan_request(&member, target, &code, deadline)?;
@@ -192,6 +193,7 @@ fn lan_lookup_sends_a_device_name_only_after_authenticating_that_exact_owner() -
             response: Response::Waiting,
         },
     )?;
+    assert_eq!(member.view().join_stage, Some("requesting_approval"));
     assert_eq!(
         prepare_lan_request(&member, owner_peer, &code, deadline)?
             .name
@@ -204,6 +206,7 @@ fn lan_lookup_sends_a_device_name_only_after_authenticating_that_exact_owner() -
     assert!(prepare_lan_request(&member, owner_peer, &code, deadline + 1).is_err());
     assert!(prepare_lan_request(&member, owner_peer, "AAAAAAAAAAAAAAAA", deadline).is_err());
     member.cancel_join()?;
+    assert_eq!(member.view().join_stage, None);
     assert!(prepare_lan_request(&member, owner_peer, &code, deadline).is_err());
     assert!(apply_lan_response(
         &mut member,
@@ -217,6 +220,7 @@ fn lan_lookup_sends_a_device_name_only_after_authenticating_that_exact_owner() -
     )
     .is_err());
     assert!(member.lan_joining.is_none());
+    assert_eq!(member.view().join_stage, None);
     Ok(())
 }
 
@@ -423,6 +427,53 @@ async fn view_changed(
 
 #[cfg(windows)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn full_invite_progress_requires_an_owner_ack_and_ignores_replaced_join() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let owner = Engine::open(&root.path().join("owner"), Arc::new(|_| {}))?;
+    let member = Engine::open(&root.path().join("member"), Arc::new(|_| {}))?;
+    owner.lock().await.create_workspace("Office".into())?;
+    let invite = owner.lock().await.create_invite()?;
+    member.lock().await.join(&invite)?;
+    assert_eq!(
+        member.lock().await.view().join_stage,
+        Some("contacting_owner")
+    );
+    let invitation = Invitation::parse(&invite)?;
+    let owner_peer = owner.lock().await.key.public().to_peer_id();
+    let mut nodes = Nodes::default();
+    let result: Result<()> = async {
+        let a = Node::start(owner.clone(), false).await?;
+        nodes.0.push(a.clone());
+        let b = Node::start(member.clone(), false).await?;
+        nodes.0.push(b.clone());
+        b.connect(owner_peer, listener(&a, true).await?).await?;
+        connected(&b, owner_peer).await?;
+        b.poll_join(invitation.clone()).await?;
+        assert_eq!(
+            member.lock().await.view().join_stage,
+            Some("awaiting_approval")
+        );
+        assert!(!owner.lock().await.view().pending.is_empty());
+        member.lock().await.cancel_join()?;
+        b.poll_join(invitation.clone()).await?;
+        assert_eq!(member.lock().await.view().join_stage, None);
+        // The old request's acknowledgment must not advance another join attempt.
+        let newer_invite = owner.lock().await.create_invite()?;
+        member.lock().await.join(&newer_invite)?;
+        b.poll_join(invitation).await?;
+        assert_eq!(
+            member.lock().await.view().join_stage,
+            Some("contacting_owner")
+        );
+        Ok(())
+    }
+    .await;
+    nodes.close().await;
+    result
+}
+
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn lan_invite_joins_after_approval_rejects_replay_and_discards_cancelled_approval(
 ) -> Result<()> {
     let root = tempfile::tempdir()?;
@@ -472,6 +523,10 @@ async fn lan_invite_joins_after_approval_rejects_replay_and_discards_cancelled_a
             view.pending
                 .iter()
                 .any(|pending| pending.peer_id == member_peer.to_string())
+        })
+        .await?;
+        view_changed(&member, &mut member_updates, |view| {
+            view.join_stage == Some("awaiting_approval")
         })
         .await?;
         assert!(member.lock().await.persisted.joining.is_none());

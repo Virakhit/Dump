@@ -17,6 +17,7 @@ jobs:
       - run: rustup toolchain install stable --profile minimal --component clippy --component rustfmt
       - run: npm ci
       - run: npm run build
+      - run: npm run test:ui
       - run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
       - run: cargo test --manifest-path src-tauri/Cargo.toml --locked --test chat
       - run: cargo test --manifest-path src-tauri/Cargo.toml --no-default-features --locked
