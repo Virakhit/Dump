@@ -31,6 +31,7 @@ use tokio_util::sync::CancellationToken;
 pub const PORT: u16 = 42042;
 pub const BANDWIDTH: usize = 2 * 1024 * 1024;
 const BURST: usize = 64 * 1024;
+const REFILL_BATCH: usize = 8 * 1024;
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -134,7 +135,10 @@ impl<S> Throttled<S> {
             bucket.bytes = (bucket.bytes + refill).min(BURST);
             bucket.at = Instant::now();
         }
-        if bucket.bytes != 0 {
+        // Costly framed/encrypted I/O can replenish a few bytes on every poll.
+        // Wait for a useful batch instead of busy-spinning on tiny refills.
+        // Small control writes still wait only for their requested size.
+        if bucket.bytes >= wanted.min(REFILL_BATCH) {
             let grant = wanted.min(bucket.bytes);
             bucket.bytes -= grant;
             *sleep = None;
