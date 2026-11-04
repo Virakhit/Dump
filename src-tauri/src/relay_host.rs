@@ -408,9 +408,7 @@ mod tests {
                     .poll_read(&mut cx, &mut byte)
                     .is_pending());
             } else {
-                assert!(Pin::new(&mut stream)
-                    .poll_write(&mut cx, &[7])
-                    .is_pending());
+                assert!(Pin::new(&mut stream).poll_write(&mut cx, &[7]).is_pending());
             }
             // Another stream can refund its unused grant into the shared bucket.
             budget.lock().unwrap().bytes = 1;
