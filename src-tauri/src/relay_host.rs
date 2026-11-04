@@ -113,14 +113,21 @@ type Budget = Arc<Mutex<Bucket>>;
 struct Throttled<S> {
     inner: S,
     budget: Budget,
-    sleep: Option<Pin<Box<tokio::time::Sleep>>>,
+    // Duplex traffic must not cancel the other direction's pending wakeup.
+    read_sleep: Option<Pin<Box<tokio::time::Sleep>>>,
+    write_sleep: Option<Pin<Box<tokio::time::Sleep>>>,
 }
 impl<S> Throttled<S> {
-    fn grant(&mut self, cx: &mut Context<'_>, wanted: usize) -> Poll<usize> {
+    fn grant(
+        budget: &Budget,
+        sleep: &mut Option<Pin<Box<tokio::time::Sleep>>>,
+        cx: &mut Context<'_>,
+        wanted: usize,
+    ) -> Poll<usize> {
         if wanted == 0 {
             return Poll::Ready(0);
         }
-        let mut bucket = self.budget.lock().unwrap_or_else(|e| e.into_inner());
+        let mut bucket = budget.lock().unwrap_or_else(|e| e.into_inner());
         let refill = (bucket.at.elapsed().as_nanos() * BANDWIDTH as u128 / 1_000_000_000)
             .min(BURST as u128) as usize;
         if refill != 0 {
@@ -130,15 +137,14 @@ impl<S> Throttled<S> {
         if bucket.bytes != 0 {
             let grant = wanted.min(bucket.bytes);
             bucket.bytes -= grant;
-            self.sleep = None;
+            *sleep = None;
             return Poll::Ready(grant);
         }
         drop(bucket);
-        let sleep = self
-            .sleep
-            .get_or_insert_with(|| Box::pin(tokio::time::sleep(Duration::from_millis(1))));
-        if sleep.as_mut().poll(cx).is_ready() {
-            self.sleep = None;
+        let waiting =
+            sleep.get_or_insert_with(|| Box::pin(tokio::time::sleep(Duration::from_millis(1))));
+        if waiting.as_mut().poll(cx).is_ready() {
+            *sleep = None;
             cx.waker().wake_by_ref();
         }
         Poll::Pending
@@ -160,7 +166,12 @@ impl<S: AsyncRead + Unpin> AsyncRead for Throttled<S> {
         bytes: &mut [u8],
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
-        let grant = futures::ready!(this.grant(cx, bytes.len()));
+        let grant = futures::ready!(Self::grant(
+            &this.budget,
+            &mut this.read_sleep,
+            cx,
+            bytes.len()
+        ));
         let result = Pin::new(&mut this.inner).poll_read(cx, &mut bytes[..grant]);
         this.refund(grant, &result);
         result
@@ -173,7 +184,12 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Throttled<S> {
         bytes: &[u8],
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
-        let grant = futures::ready!(this.grant(cx, bytes.len()));
+        let grant = futures::ready!(Self::grant(
+            &this.budget,
+            &mut this.write_sleep,
+            cx,
+            bytes.len()
+        ));
         let result = Pin::new(&mut this.inner).poll_write(cx, &bytes[..grant]);
         this.refund(grant, &result);
         result
@@ -202,7 +218,8 @@ impl StreamMuxer for Mux {
             .map_ok(|inner| Throttled {
                 inner,
                 budget: this.budget.clone(),
-                sleep: None,
+                read_sleep: None,
+                write_sleep: None,
             })
     }
     fn poll_outbound(
@@ -215,7 +232,8 @@ impl StreamMuxer for Mux {
             .map_ok(|inner| Throttled {
                 inner,
                 budget: this.budget.clone(),
-                sleep: None,
+                read_sleep: None,
+                write_sleep: None,
             })
     }
     fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -396,7 +414,8 @@ mod tests {
             let mut stream = Throttled {
                 inner: futures::io::Cursor::new(vec![42; 4]),
                 budget: budget.clone(),
-                sleep: None,
+                read_sleep: None,
+                write_sleep: None,
             };
             let woke = Arc::new(Woken::default());
             let waker = Waker::from(woke.clone());
@@ -440,12 +459,14 @@ mod tests {
         let mut a = Throttled {
             inner: futures::io::sink(),
             budget: budget.clone(),
-            sleep: None,
+            read_sleep: None,
+            write_sleep: None,
         };
         let mut b = Throttled {
             inner: futures::io::sink(),
             budget,
-            sleep: None,
+            read_sleep: None,
+            write_sleep: None,
         };
         let bytes = vec![0; BANDWIDTH / 2];
         let at = Instant::now();
