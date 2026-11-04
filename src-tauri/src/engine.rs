@@ -1,4 +1,8 @@
-use crate::{model::*, storage::Store};
+use crate::{
+    lan_invite::{self, LanInvite, LanJoin},
+    model::*,
+    storage::Store,
+};
 use anyhow::{ensure, Context, Result};
 use libp2p::identity::Keypair;
 use serde::{Deserialize, Serialize};
@@ -92,6 +96,8 @@ pub struct Engine {
     pub invite_url: Option<String>,
     pub last_error: Option<String>,
     pub notify: Notify,
+    pub(crate) lan_invites: BTreeMap<String, LanInvite>,
+    pub(crate) lan_joining: Option<LanJoin>,
 }
 impl Engine {
     pub fn open(directory: &Path, notify: Notify) -> Result<Shared> {
@@ -132,6 +138,8 @@ impl Engine {
             invite_url: None,
             last_error: cleanup_failed.then(|| PARTIAL_CLEANUP_FAILED.into()),
             notify,
+            lan_invites: BTreeMap::new(),
+            lan_joining: None,
         })))
     }
     pub fn peer(&self) -> String {
@@ -224,7 +232,7 @@ impl Engine {
                 .cloned()
                 .collect(),
             preparing: self.preparing.clone(),
-            joining: self.persisted.joining.is_some(),
+            joining: self.persisted.joining.is_some() || self.lan_joining.is_some(),
             network_status: self.network_status.clone(),
             relay_peers: self.relay_peers.clone(),
             transfers: self.transfers.values().cloned().collect(),
@@ -295,6 +303,77 @@ impl Engine {
         self.online.clear();
         self.relay_peers.clear();
         self.invite_url = None;
+        self.pending.retain(|_, pending| {
+            !self
+                .lan_invites
+                .values()
+                .any(|invite| invite.record.token_hash == pending.token_hash)
+        });
+        self.lan_invites.clear();
+        self.lan_joining = None;
+    }
+    pub fn create_lan_invite(&mut self) -> Result<String> {
+        let snapshot = self.active_snapshot()?;
+        ensure!(
+            snapshot.owner_peer_id == self.peer(),
+            "Only the workspace owner can invite"
+        );
+        self.expire_lan_invites();
+        ensure!(
+            self.lan_invites.len()
+                + self
+                    .persisted
+                    .invites
+                    .iter()
+                    .filter(|i| i.expires_at > now())
+                    .count()
+                < 128,
+            "Too many invitations; wait for old ones to expire"
+        );
+        let invitation = Invitation {
+            version: VERSION,
+            workspace_id: snapshot.workspace_id,
+            owner_peer_id: self.peer(),
+            token: random_secret(),
+            contact: None,
+        };
+        let code = lan_invite::code(&invitation)?;
+        ensure!(
+            !self.lan_invites.contains_key(&code),
+            "Please create another LAN invitation"
+        );
+        let record = InviteRecord {
+            workspace_id: snapshot.workspace_id,
+            token_hash: digest(invitation.token.as_bytes()),
+            expires_at: now().saturating_add(lan_invite::LIFETIME),
+            approved_peer: None,
+        };
+        self.lan_invites
+            .insert(code.clone(), LanInvite { invitation, record });
+        let url = format!("{}{code}", lan_invite::PREFIX);
+        self.invite_url = Some(url.clone());
+        self.emit();
+        Ok(url)
+    }
+    pub(crate) fn expire_lan_invites(&mut self) {
+        let expired: Vec<_> = self
+            .lan_invites
+            .values()
+            .filter(|invite| invite.record.expires_at <= now())
+            .map(|invite| invite.record.token_hash.clone())
+            .collect();
+        self.lan_invites
+            .retain(|_, invite| invite.record.expires_at > now());
+        self.pending
+            .retain(|_, pending| !expired.contains(&pending.token_hash));
+        if self
+            .lan_joining
+            .as_ref()
+            .is_some_and(|join| join.expires_at <= now())
+        {
+            self.lan_joining = None;
+            self.last_error = Some("LAN invitation expired. Ask the owner for a new link and stay on the same local network.".into());
+        }
     }
     pub fn create_invite(&mut self) -> Result<String> {
         let snapshot = self.active_snapshot()?;
@@ -302,11 +381,12 @@ impl Engine {
             snapshot.owner_peer_id == self.peer(),
             "Only the workspace owner can invite"
         );
+        self.expire_lan_invites();
         let token = random_secret();
         let mut next = self.persisted.clone();
         next.invites.retain(|i| i.expires_at > now());
         ensure!(
-            next.invites.len() < 128,
+            next.invites.len() + self.lan_invites.len() < 128,
             "Too many invitations; wait for old ones to expire"
         );
         next.invites.push(InviteRecord {
@@ -416,6 +496,27 @@ impl Engine {
         Ok(())
     }
     pub fn join(&mut self, value: &str) -> Result<()> {
+        if value.trim().starts_with(lan_invite::PREFIX) {
+            let code = lan_invite::parse_url(value)?;
+            self.expire_lan_invites();
+            ensure!(
+                !self.lan_invites.contains_key(&code),
+                "This is your own invitation"
+            );
+            if self.persisted.joining.is_some() {
+                let mut next = self.persisted.clone();
+                next.joining = None;
+                self.persist(next)?;
+            }
+            self.lan_joining = Some(LanJoin {
+                code,
+                expires_at: now().saturating_add(lan_invite::LIFETIME),
+                owner_peer_id: None,
+            });
+            self.last_error = None;
+            self.emit();
+            return Ok(());
+        }
         let invite = Invitation::parse(value)?;
         ensure!(
             invite.owner_peer_id != self.peer(),
@@ -430,13 +531,17 @@ impl Engine {
         let mut next = self.persisted.clone();
         next.joining = Some(invite);
         self.persist(next)?;
+        self.lan_joining = None;
         self.emit();
         Ok(())
     }
     pub fn cancel_join(&mut self) -> Result<()> {
-        let mut next = self.persisted.clone();
-        next.joining = None;
-        self.persist(next)?;
+        if self.persisted.joining.is_some() {
+            let mut next = self.persisted.clone();
+            next.joining = None;
+            self.persist(next)?;
+        }
+        self.lan_joining = None;
         self.emit();
         Ok(())
     }
@@ -460,17 +565,24 @@ impl Engine {
             "Not the workspace owner"
         );
         let mut next = self.persisted.clone();
-        let invite = next
-            .invites
-            .iter_mut()
-            .find(|i| {
-                i.workspace_id == snapshot.workspace_id
-                    && i.token_hash == pending.token_hash
-                    && i.expires_at > now()
-                    && i.approved_peer.is_none()
-            })
-            .context("Invitation expired or already used")?;
-        invite.approved_peer = Some(peer.into());
+        let can_approve = |i: &InviteRecord| {
+            i.workspace_id == snapshot.workspace_id
+                && i.token_hash == pending.token_hash
+                && i.expires_at > now()
+                && i.approved_peer.is_none()
+        };
+        let lan_code = if let Some(invite) = next.invites.iter_mut().find(|i| can_approve(i)) {
+            invite.approved_peer = Some(peer.into());
+            None
+        } else {
+            Some(
+                self.lan_invites
+                    .iter()
+                    .find(|(_, invite)| can_approve(&invite.record))
+                    .map(|(code, _)| code.clone())
+                    .context("Invitation expired or already used")?,
+            )
+        };
         if !snapshot.contains(peer) {
             snapshot.members.push(Member {
                 peer_id: peer.into(),
@@ -488,6 +600,17 @@ impl Engine {
             .snapshot = snapshot.clone();
         next.audit("member-approved", snapshot.workspace_id, peer);
         self.persist(next)?;
+        if let Some(code) = lan_code {
+            // Bind only after the signed roster was saved successfully. The same
+            // device may poll for its grant until this in-memory invite expires.
+            self.lan_invites
+                .get_mut(&code)
+                .unwrap()
+                .record
+                .approved_peer = Some(peer.into());
+            self.pending
+                .retain(|_, request| request.token_hash != pending.token_hash);
+        }
         self.pending.remove(peer);
         self.emit();
         Ok(())
@@ -505,6 +628,10 @@ impl Engine {
         let mut next = self.persisted.clone();
         next.invites.retain(|i| i.token_hash != pending.token_hash);
         self.persist(next)?;
+        self.lan_invites
+            .retain(|_, invite| invite.record.token_hash != pending.token_hash);
+        self.pending
+            .retain(|_, request| request.token_hash != pending.token_hash);
         self.pending.remove(peer);
         self.emit();
         Ok(())
@@ -529,6 +656,8 @@ impl Engine {
             .retain(|i| i.approved_peer.as_deref() != Some(peer));
         next.audit("member-removed", next.active.unwrap(), peer);
         self.persist(next)?;
+        self.lan_invites
+            .retain(|_, invite| invite.record.approved_peer.as_deref() != Some(peer));
         self.reconcile();
         self.emit();
         Ok(())
@@ -635,12 +764,23 @@ impl Engine {
         }
     }
     pub fn mark_transfer(&mut self, id: Uuid, status: &str, bytes: u64, error: Option<String>) {
+        let terminal = ["Completed", "Cancelled", "Failed"].contains(&status);
+        // A disk operation can finish after cancellation. Its late progress
+        // must not erase the reason already recorded by the network actor.
+        if !terminal
+            && self
+                .cancellations
+                .get(&id)
+                .is_some_and(|cancel| cancel.is_cancelled())
+        {
+            return;
+        }
         if let Some(t) = self.transfers.get_mut(&id) {
             t.status = status.into();
             t.bytes = bytes;
             t.error = error;
         }
-        if ["Completed", "Cancelled", "Failed"].contains(&status) {
+        if terminal {
             self.cancellations.remove(&id);
         }
         self.emit();
@@ -893,6 +1033,7 @@ pub enum Action {
     CreateWorkspace { name: String },
     Activate { id: Uuid },
     SetName { name: String },
+    CreateLanInvite,
     CreateInvite,
     Join { invite: String },
     CancelJoin,
@@ -908,6 +1049,7 @@ pub fn dispatch(engine: &mut Engine, action: Action) -> Result<()> {
         Action::CreateWorkspace { name } => engine.create_workspace(name),
         Action::Activate { id } => engine.activate(id),
         Action::SetName { name } => engine.set_name(name),
+        Action::CreateLanInvite => engine.create_lan_invite().map(|_| ()),
         Action::CreateInvite => engine.create_invite().map(|_| ()),
         Action::Join { invite } => engine.join(&invite),
         Action::CancelJoin => engine.cancel_join(),

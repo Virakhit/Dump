@@ -10,7 +10,7 @@ use crate::{
     model::*,
     reachability::{Client as NatClient, PublicAddresses},
     storage::commit_download,
-    streams::Streams,
+    streams::{lan_address, lan_endpoint, Streams},
 };
 use anyhow::{bail, ensure, Context, Result};
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, StreamExt};
@@ -44,7 +44,12 @@ use uuid::Uuid;
 const CONTROL: StreamProtocol = StreamProtocol::new("/dump/control/1");
 const FILE: StreamProtocol = StreamProtocol::new("/dump/file/1");
 const CONTACT: StreamProtocol = StreamProtocol::new("/dump/contact/1");
+const LAN_INVITE: StreamProtocol = StreamProtocol::new("/dump/lan-invite/1");
 const PREAUTH_TIMEOUT: Duration = Duration::from_secs(5);
+const LAN_LOOKUP_TIMEOUT: Duration = Duration::from_secs(45);
+const LAN_POLL_INTERVAL: Duration = Duration::from_secs(4);
+const MAX_LAN_DISCOVERED: usize = 64;
+const MAX_LAN_IN_FLIGHT: usize = 4;
 const INACTIVITY: Duration = Duration::from_secs(30);
 const RELAY_INTERRUPTED: &str = "Relay connection closed or stalled. Its transfer limit may have been reached. Try again manually using a direct connection or ask the relay operator about limits.";
 
@@ -98,6 +103,7 @@ struct Behaviour {
     limits: connection_limits::Behaviour,
     streams: Streams,
     relay_streams: Streams,
+    lan_streams: Streams,
     relay: relay::client::Behaviour,
     mdns: Toggle<mdns::tokio::Behaviour>,
     ping: ping::Behaviour,
@@ -152,6 +158,151 @@ struct ContactRequest {
 struct ContactResponse {
     contacts: Vec<crate::contact::Contact>,
     total: u32,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LanInviteRequest {
+    code: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+}
+
+fn prepare_lan_request(
+    e: &crate::engine::Engine,
+    peer: PeerId,
+    code: &str,
+    deadline: u64,
+) -> Result<LanInviteRequest> {
+    let join = e
+        .lan_joining
+        .as_ref()
+        .filter(|join| join.code == code && join.expires_at == deadline && join.expires_at > now())
+        .context("LAN join was cancelled or expired")?;
+    let peer_name = peer.to_string();
+    Ok(LanInviteRequest {
+        code: code.into(),
+        // A queued lookup can start after another peer has been authenticated.
+        // Only that exact owner is allowed to learn this device's name.
+        name: join
+            .owner_peer_id
+            .as_deref()
+            .filter(|owner| *owner == peer_name.as_str())
+            .map(|_| e.persisted.device_name.clone()),
+    })
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+enum LanInviteResponse {
+    Found {
+        invitation: Box<Invitation>,
+        response: Response,
+    },
+    Unavailable,
+}
+
+/// Keep mDNS provenance separate from the general address book, which also
+/// contains explicit, Identify, and Internet-contact routes.
+#[derive(Default)]
+struct LanDiscovery(BTreeMap<PeerId, Vec<Multiaddr>>);
+
+enum LanAttempt {
+    Dial(PeerId, Multiaddr),
+    Poll(PeerId),
+}
+
+impl LanDiscovery {
+    fn remember(&mut self, peer: PeerId, address: &Multiaddr, allow_loopback: bool) {
+        let Some(address) = lan_address(peer, address, allow_loopback) else {
+            return;
+        };
+        if self.0.len() >= MAX_LAN_DISCOVERED && !self.0.contains_key(&peer) {
+            return;
+        }
+        let routes = self.0.entry(peer).or_default();
+        if routes.len() < MAX_ADDRESSES && !routes.contains(&address) {
+            routes.push(address);
+        }
+    }
+
+    fn expire(&mut self, peer: PeerId, address: &Multiaddr, allow_loopback: bool) {
+        let Some(address) = lan_address(peer, address, allow_loopback) else {
+            return;
+        };
+        if let Some(routes) = self.0.get_mut(&peer) {
+            routes.retain(|route| route != &address);
+            if routes.is_empty() {
+                self.0.remove(&peer);
+            }
+        }
+    }
+
+    fn contains(&self, peer: &PeerId) -> bool {
+        self.0.contains_key(peer)
+    }
+
+    fn schedule(
+        &self,
+        owner: Option<&str>,
+        connections: &BTreeMap<ConnectionId, PeerId>,
+        ongoing: &BTreeSet<PeerId>,
+        attempts: &mut BTreeMap<PeerId, (Instant, usize)>,
+        polled: &mut BTreeSet<PeerId>,
+        at: Instant,
+    ) -> Vec<LanAttempt> {
+        attempts.retain(|peer, _| self.contains(peer));
+        polled.retain(|peer| self.contains(peer));
+        let connected: BTreeSet<_> = connections.values().copied().collect();
+        let mut candidates: Vec<_> = self
+            .0
+            .keys()
+            .copied()
+            .filter(|peer| owner.is_none_or(|owner| owner == peer.to_string()))
+            .collect();
+        candidates.sort_by_key(|peer| {
+            (
+                polled.contains(peer),
+                !connected.contains(peer),
+                attempts.get(peer).map(|(at, _)| *at),
+            )
+        });
+        let mut dials = MAX_LAN_IN_FLIGHT;
+        let mut polls = MAX_LAN_IN_FLIGHT.saturating_sub(ongoing.len());
+        let mut planned = Vec::new();
+        for peer in candidates {
+            if dials == 0 && polls == 0 {
+                break;
+            }
+            let first_lookup = connected.contains(&peer) && !polled.contains(&peer);
+            if ongoing.contains(&peer)
+                || (!first_lookup
+                    && attempts.get(&peer).is_some_and(|(last, _)| {
+                        at.saturating_duration_since(*last) < LAN_POLL_INTERVAL
+                    }))
+            {
+                continue;
+            }
+            let index = attempts.get(&peer).map_or(0, |(_, index)| *index);
+            if connected.contains(&peer) {
+                if polls == 0 {
+                    continue;
+                }
+                polls -= 1;
+                polled.insert(peer);
+                planned.push(LanAttempt::Poll(peer));
+            } else {
+                if dials == 0 {
+                    continue;
+                }
+                dials -= 1;
+                let routes = &self.0[&peer];
+                planned.push(LanAttempt::Dial(peer, routes[index % routes.len()].clone()));
+            }
+            attempts.insert(peer, (at, index + 1));
+        }
+        planned
+    }
 }
 
 pub async fn write_frame<S: AsyncWrite + Unpin, T: Serialize>(
@@ -232,6 +383,8 @@ struct Dial {
     address: Multiaddr,
     reply: oneshot::Sender<Result<()>>,
     reserve: bool,
+    #[cfg(test)]
+    test_mdns: Option<bool>,
 }
 
 struct ProtocolReport {
@@ -291,6 +444,7 @@ pub struct Node {
     pub shared: Shared,
     pub control: Control,
     relay_control: Control,
+    lan_control: Control,
     dial: mpsc::Sender<Dial>,
     protocol_reports: mpsc::Sender<ProtocolReport>,
     tasks: TaskTracker,
@@ -328,6 +482,7 @@ impl Node {
             .with_behaviour(|key, relay| Behaviour {
                 streams: Streams::new(false),
                 relay_streams: Streams::new(true),
+                lan_streams: Streams::lan(allow_loopback),
                 relay,
                 mdns: mdns.into(),
                 ping: ping::Behaviour::new(
@@ -350,7 +505,9 @@ impl Node {
                         .with_max_pending_incoming(Some(16))
                         .with_max_pending_outgoing(Some(16))
                         .with_max_established(Some(128))
-                        .with_max_established_per_peer(Some(2)),
+                        // Leave room for LAN QUIC alongside a public route and
+                        // a circuit carrying an existing transfer.
+                        .with_max_established_per_peer(Some(3)),
                 ),
             })?
             .with_swarm_config(|config| {
@@ -375,6 +532,8 @@ impl Node {
         )?;
         let mut control = swarm.behaviour().streams.control();
         let mut relay_control = swarm.behaviour().relay_streams.control();
+        let mut lan_control = swarm.behaviour().lan_streams.control();
+        let mut lan_incoming = lan_control.accept(LAN_INVITE)?;
         let mut incoming =
             futures::stream::select(control.accept(CONTROL)?, relay_control.accept(CONTROL)?);
         let mut files = futures::stream::select(
@@ -415,6 +574,7 @@ impl Node {
             shared: shared.clone(),
             control: control.clone(),
             relay_control,
+            lan_control,
             dial,
             protocol_reports,
             tasks: tasks.clone(),
@@ -433,13 +593,19 @@ impl Node {
         let actor_tasks = tasks.clone();
         tasks.spawn(async move {
             let mut discovered = AddressBook::default();
+            let mut lan_discovered = LanDiscovery::default();
             let in_flight = Arc::new(Mutex::new(BTreeSet::new()));
+            let lan_in_flight = Arc::new(Mutex::new(BTreeSet::new()));
+            let mut lan_lookup: Option<(String, u64, Instant)> = None;
+            let mut lan_attempts: BTreeMap<PeerId, (Instant, usize)> = BTreeMap::new();
+            let mut lan_polled = BTreeSet::new();
             let mut last_join = 0;
             let mut tick = tokio::time::interval(Duration::from_secs(2));
             let mut listeners = Vec::new();
             let mut public = PublicAddresses::default();
             let mut reservations = BTreeMap::new();
             let mut connections = BTreeMap::new();
+            let mut lan_connections = BTreeMap::new();
             let mut attempts: BTreeMap<PeerId, (Instant, usize)> = BTreeMap::new();
             loop {
                 tokio::select! {
@@ -457,7 +623,23 @@ impl Node {
                             d.protocol_outcome = Some(report.outcome);
                         } });
                     },
-                    Some(Dial { peer, address, reply, reserve }) = dials.recv() => {
+                    Some(dial) = dials.recv() => {
+                        #[cfg(test)]
+                        if let Some(present) = dial.test_mdns {
+                            let result = if allow_loopback {
+                                if present {
+                                    lan_discovered.remember(dial.peer, &dial.address, true);
+                                } else {
+                                    lan_discovered.expire(dial.peer, &dial.address, true);
+                                }
+                                Ok(())
+                            } else {
+                                Err(anyhow::anyhow!("Synthetic mDNS requires the private test harness"))
+                            };
+                            let _ = dial.reply.send(result);
+                            continue;
+                        }
+                        let Dial { peer, address, reply, reserve, .. } = dial;
                         let result = (|| {
                             discovered.remember(peer, address.clone())?;
                             swarm.add_peer_address(peer, address.clone());
@@ -480,6 +662,23 @@ impl Node {
                             Ok(())
                         })();
                         let _ = reply.send(result);
+                    },
+                    Some((peer, stream)) = lan_incoming.next() => {
+                        // The dedicated control excludes public, TCP and relay
+                        // connections even when the peer also has a LAN connection.
+                        if lan_discovered.contains(&peer) {
+                            if let Ok(permit) = incoming_slots.clone().try_acquire_owned() {
+                                let state = shared.clone();
+                                let stopped = shutdown.clone();
+                                actor_tasks.spawn(async move {
+                                    let _permit = permit;
+                                    tokio::select! {
+                                        _ = stopped.cancelled() => {},
+                                        _ = serve_lan_invite(state, peer, stream) => {},
+                                    }
+                                });
+                            }
+                        }
                     },
                     Some((peer, stream)) = incoming.next() => {
                         if let Ok(permit) = incoming_slots.clone().try_acquire_owned() {
@@ -536,9 +735,13 @@ impl Node {
                             }
                         },
                         SwarmEvent::Behaviour(BehaviourEvent::Mdns(mdns::Event::Discovered(peers))) => for (peer, address) in peers {
+                            lan_discovered.remember(peer, &address, allow_loopback);
                             if discovered.remember(peer, address.clone()).is_ok_and(|added| added) {
                                 swarm.add_peer_address(peer, address);
                             }
+                        },
+                        SwarmEvent::Behaviour(BehaviourEvent::Mdns(mdns::Event::Expired(peers))) => for (peer, address) in peers {
+                            lan_discovered.expire(peer, &address, allow_loopback);
                         },
                         SwarmEvent::Behaviour(BehaviourEvent::Identify(identify::Event::Received { peer_id, info, .. })) => {
                             if info.public_key.to_peer_id() == peer_id {
@@ -585,6 +788,9 @@ impl Node {
                         },
                         SwarmEvent::ConnectionEstablished { peer_id, connection_id, endpoint, .. } => {
                             connections.insert(connection_id, (peer_id, endpoint.is_relayed()));
+                            if lan_endpoint(peer_id, &endpoint, allow_loopback) {
+                                lan_connections.insert(connection_id, peer_id);
+                            }
                             diagnostic_tx.send_modify(|d| {
                                 if let Some(d) = diagnostic(d, peer_id) {
                                     d.state = connection_state(&connections, peer_id);
@@ -602,6 +808,7 @@ impl Node {
                         },
                         SwarmEvent::ConnectionClosed { peer_id, connection_id, num_established, .. } => {
                             connections.remove(&connection_id);
+                            lan_connections.remove(&connection_id);
                             if num_established != 0 {
                                 diagnostic_tx.send_modify(|d| { if let Some(d) = diagnostic(d, peer_id) { d.state = connection_state(&connections, peer_id); } });
                                 continue;
@@ -646,6 +853,26 @@ impl Node {
                             reachability_tx.send_replace(Reachability { status: if addresses.is_empty() { ReachabilityStatus::Unknown } else { ReachabilityStatus::Public }, public_addresses: addresses });
                         }
                         let mut e = shared.lock().await;
+                        e.expire_lan_invites();
+                        let mut lan_joining = e.lan_joining.as_ref().map(|join| (join.code.clone(), join.expires_at, join.owner_peer_id.clone()));
+                        if let Some((code, expires_at, _)) = &lan_joining {
+                            if !lan_lookup.as_ref().is_some_and(|(old, deadline, _)| old == code && deadline == expires_at) {
+                                lan_lookup = Some((code.clone(), *expires_at, Instant::now()));
+                                lan_attempts.clear();
+                                lan_polled.clear();
+                            }
+                            if lan_joining.as_ref().is_some_and(|(_, _, owner)| owner.is_none())
+                                && lan_lookup.as_ref().is_some_and(|(_, _, started)| started.elapsed() >= LAN_LOOKUP_TIMEOUT)
+                            {
+                                e.lan_joining = None;
+                                lan_joining = None;
+                                e.error("LAN invitation was not found. Keep both devices on the same LAN with Dump open, check that discovery is allowed, and ask the owner for a new link if it expired.");
+                            }
+                        } else {
+                            lan_lookup = None;
+                            lan_attempts.clear();
+                            lan_polled.clear();
+                        }
                         e.relay_peers = e.online.keys().filter_map(|p| p.parse().ok()).filter(|p| connection_state(&connections, *p) == ConnectionState::Relay).map(|p: PeerId| p.to_string()).collect();
                         let mut own_addresses: Vec<_> = reachability_tx.borrow().public_addresses.iter().chain(listeners.iter()).filter(|a| !is_relayed(a) && public_address(a)).filter_map(|a| peer_address(peer, a.clone()).ok()).map(|a| a.to_string()).collect();
                         own_addresses.sort(); own_addresses.dedup(); own_addresses.truncate(MAX_ADDRESSES - 3);
@@ -681,7 +908,7 @@ impl Node {
                             }
                             attempts.insert(*target, (Instant::now(), index + 1));
                         }
-                        e.network_status = if !e.online.is_empty() { if e.online.keys().filter_map(|p| p.parse().ok()).any(|p| connection_state(&connections, p) == ConnectionState::Direct) { "Connected directly" } else { "Connected via relay" } } else if joining.is_some() || desired.iter().any(|p| diagnostic_tx.borrow().get(p).is_some_and(|d| d.state == ConnectionState::Connecting)) { "Connecting…" } else if listeners.is_empty() || !desired.is_empty() { "Offline" } else if discovery { "LAN discovery is running" } else { "Offline" }.into();
+                        e.network_status = if !e.online.is_empty() { if e.online.keys().filter_map(|p| p.parse::<PeerId>().ok()).any(|p| connection_state(&connections, p) == ConnectionState::Direct) { "Connected directly" } else { "Connected via relay" } } else if joining.is_some() || lan_joining.is_some() || desired.iter().any(|p| diagnostic_tx.borrow().get(p).is_some_and(|d| d.state == ConnectionState::Connecting)) { "Connecting…" } else if listeners.is_empty() || !desired.is_empty() { "Offline" } else if discovery { "LAN discovery is running" } else { "Offline" }.into();
                         e.emit(); drop(e);
                         for target in targets.into_iter().filter(|p| connection_state(&connections, *p) != ConnectionState::Offline) {
                             let mut ongoing = in_flight.lock().await;
@@ -701,16 +928,42 @@ impl Node {
                                 }
                             }
                         }
+                        if let Some((code, deadline, owner)) = lan_joining {
+                            let mut ongoing = lan_in_flight.lock().await;
+                            // Dialing and querying have independent bounded budgets,
+                            // so discovery does not postpone all lookups until every
+                            // candidate has been dialed. First lookups precede retries.
+                            let planned = lan_discovered.schedule(owner.as_deref(), &lan_connections, &ongoing, &mut lan_attempts, &mut lan_polled, Instant::now());
+                            for attempt in planned {
+                                match attempt {
+                                LanAttempt::Poll(target) if target != peer => {
+                                    ongoing.insert(target);
+                                    let node = poll_node.clone();
+                                    let code = code.clone();
+                                    let ongoing = lan_in_flight.clone();
+                                    actor_tasks.spawn(async move {
+                                        tokio::select! {
+                                            _ = node.shutdown.cancelled() => {},
+                                            _ = node.poll_lan_invite(target, &code, deadline) => {},
+                                        }
+                                        ongoing.lock().await.remove(&target);
+                                    });
+                                }
+                                LanAttempt::Dial(target, address) if target != peer => {
+                                    let condition = if connection_state(&connections, target) == ConnectionState::Offline { PeerCondition::DisconnectedAndNotDialing } else { PeerCondition::Always };
+                                    // Explicit addresses do not extend through other behaviours;
+                                    // no Internet contact, relay or stale general route is used.
+                                    let _ = swarm.dial(DialOpts::peer_id(target).condition(condition).addresses(vec![address.with(libp2p::multiaddr::Protocol::P2p(target))]).build());
+                                }
+                                _ => {},
+                                }
+                            }
+                        }
                     }
                 }
             }
             let mut e = shared.lock().await;
-            for token in e.cancellations.values() {
-                token.cancel();
-            }
-            e.online.clear();
-            e.remote.clear();
-            e.relay_peers.clear();
+            e.reset_runtime();
             e.network_status = "Offline".into();
             e.emit();
             diagnostic_tx.send_modify(|d| d.clear());
@@ -776,6 +1029,8 @@ impl Node {
                 address,
                 reply,
                 reserve: false,
+                #[cfg(test)]
+                test_mdns: None,
             })
             .await?;
         // Acknowledges registration, not connection success; consult diagnostics for that.
@@ -792,6 +1047,23 @@ impl Node {
                 address,
                 reply,
                 reserve: true,
+                #[cfg(test)]
+                test_mdns: None,
+            })
+            .await?;
+        tokio::time::timeout(PREAUTH_TIMEOUT, registered).await??
+    }
+
+    #[cfg(test)]
+    async fn test_mdns(&self, peer: PeerId, address: Multiaddr, present: bool) -> Result<()> {
+        let (reply, registered) = oneshot::channel();
+        self.dial
+            .send(Dial {
+                peer,
+                address,
+                reply,
+                reserve: false,
+                test_mdns: Some(present),
             })
             .await?;
         tokio::time::timeout(PREAUTH_TIMEOUT, registered).await??
@@ -858,6 +1130,21 @@ impl Node {
         self.shutdown.cancel();
         self.tasks.close();
         self.tasks.wait().await;
+    }
+    async fn poll_lan_invite(&self, peer: PeerId, code: &str, deadline: u64) -> Result<()> {
+        let request = {
+            let e = self.shared.lock().await;
+            prepare_lan_request(&e, peer, code, deadline)?
+        };
+        let mut control = self.lan_control.clone();
+        let response = tokio::time::timeout(PREAUTH_TIMEOUT, async {
+            let mut stream = control.open_stream(peer, LAN_INVITE).await?;
+            write_frame(&mut stream, &request).await?;
+            read_frame::<_, LanInviteResponse>(&mut stream).await
+        })
+        .await??;
+        let mut e = self.shared.lock().await;
+        apply_lan_response(&mut e, peer, code, deadline, response)
     }
     async fn poll_join(&self, invitation: Invitation) -> Result<()> {
         let peer = invitation.owner_peer_id.parse()?;
@@ -1086,7 +1373,17 @@ impl Node {
                 .get(&file_id)
                 .context("File is no longer available")?
                 .clone();
+            // Keep the pending route if a disconnect cancels this worker before
+            // it acquires a receive slot. receive_inner refreshes the actual route.
+            let relayed = self
+                .diagnostics
+                .borrow()
+                .get(&manifest.owner_peer_id.parse::<PeerId>()?)
+                .is_some_and(|d| d.state == ConnectionState::Relay);
             let (id, cancel) = e.register_transfer(&manifest, &manifest.owner_peer_id, "Receiving");
+            if let Some(transfer) = e.transfers.get_mut(&id) {
+                transfer.relayed = relayed;
+            }
             (manifest, id, cancel)
         };
         let node = self.clone();
@@ -1221,14 +1518,24 @@ impl Node {
         let mut last = Instant::now();
         while remaining > 0 {
             let wanted = remaining.min(BLOCK as u64) as usize;
-            tokio::select! {
+            let received = tokio::select! {
                 _ = cancel.cancelled() => bail!("Transfer cancelled"),
-                read = tokio::time::timeout(INACTIVITY, stream.read_exact(&mut buffer[..wanted])) => read.map_err(anyhow::Error::from).and_then(|r| r.map_err(Into::into)).map_err(|e| relay_error(e, relayed))?,
+                read = tokio::time::timeout(INACTIVITY, stream.read(&mut buffer[..wanted])) => read.map_err(anyhow::Error::from).and_then(|r| r.map_err(Into::into)).map_err(|e| relay_error(e, relayed))?,
             };
-            DiskWrite::write_all(&mut file, &buffer[..wanted]).await?;
-            hash.update(&buffer[..wanted]);
-            remaining -= wanted as u64;
-            total += wanted as u64;
+            if received == 0 {
+                return Err(relay_error(
+                    std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "Sender closed before the advertised file size",
+                    )
+                    .into(),
+                    relayed,
+                ));
+            }
+            DiskWrite::write_all(&mut file, &buffer[..received]).await?;
+            hash.update(&buffer[..received]);
+            remaining -= received as u64;
+            total += received as u64;
             #[cfg(test)]
             if let Some(pause) = self.limits.receive_pause.lock().await.take() {
                 self.shared
@@ -1241,7 +1548,7 @@ impl Node {
                     resumed = pause.resume => resumed?,
                 }
             }
-            if last.elapsed() >= Duration::from_millis(200) {
+            if total == received as u64 || last.elapsed() >= Duration::from_millis(200) {
                 self.shared
                     .lock()
                     .await
@@ -1281,6 +1588,153 @@ impl Node {
         commit_download(&part, &destination)?;
         Ok(())
     }
+}
+
+fn apply_lan_response(
+    e: &mut crate::engine::Engine,
+    peer: PeerId,
+    code: &str,
+    deadline: u64,
+    response: LanInviteResponse,
+) -> Result<()> {
+    let LanInviteResponse::Found {
+        invitation,
+        response,
+    } = response
+    else {
+        // Most discovered peers do not own this link. Before an owner is
+        // authenticated, an unavailable reply is not a terminal failure.
+        let peer_name = peer.to_string();
+        if e.lan_joining.as_ref().is_some_and(|join| {
+            join.code == code
+                && join.expires_at == deadline
+                && join.owner_peer_id.as_deref() == Some(peer_name.as_str())
+        }) {
+            e.lan_joining = None;
+            e.error("LAN invitation expired, was rejected, or is no longer available. Ask the owner for a new link.");
+        }
+        return Ok(());
+    };
+    crate::lan_invite::verify(&invitation, code, peer)?;
+    ensure!(
+        e.lan_joining.as_ref().is_some_and(|join| {
+            join.code == code
+                && join.expires_at == deadline
+                && join.expires_at > now()
+                && join
+                    .owner_peer_id
+                    .as_deref()
+                    .is_none_or(|owner| owner == invitation.owner_peer_id)
+        }),
+        "LAN join was cancelled or expired"
+    );
+    ensure!(
+        invitation.owner_peer_id != e.peer(),
+        "This is your own invitation"
+    );
+    match response {
+        Response::Waiting => {
+            if let Some(existing) = e.persisted.workspaces.get(&invitation.workspace_id) {
+                ensure!(
+                    existing.snapshot.owner_peer_id == invitation.owner_peer_id,
+                    "Invitation conflicts with the existing workspace owner"
+                );
+            }
+            e.lan_joining.as_mut().unwrap().owner_peer_id = Some(invitation.owner_peer_id);
+            e.emit();
+        }
+        Response::Approved { workspace } => {
+            workspace.snapshot.verify()?;
+            ensure!(
+                workspace.snapshot.workspace_id == invitation.workspace_id
+                    && workspace.snapshot.owner_peer_id == invitation.owner_peer_id
+                    && workspace.snapshot.contains(&e.peer()),
+                "Invalid LAN approval"
+            );
+            if let Some(old) = e.persisted.workspaces.get(&invitation.workspace_id) {
+                ensure!(
+                    workspace.snapshot.owner_peer_id == old.snapshot.owner_peer_id
+                        && workspace.snapshot.owner_public_key == old.snapshot.owner_public_key,
+                    "Workspace owner changed"
+                );
+                ensure!(
+                    workspace.snapshot.revision >= old.snapshot.revision,
+                    "Stale approval"
+                );
+                if workspace.snapshot.revision == old.snapshot.revision {
+                    ensure!(
+                        workspace.snapshot == old.snapshot,
+                        "Conflicting membership revision"
+                    );
+                }
+            }
+            let mut next = e.persisted.clone();
+            next.active = Some(invitation.workspace_id);
+            next.joining = None;
+            next.workspaces.insert(invitation.workspace_id, workspace);
+            e.persist(next)?;
+            e.reset_runtime();
+            e.emit();
+        }
+        _ => bail!("Invalid LAN invitation response"),
+    }
+    Ok(())
+}
+
+async fn serve_lan_invite(shared: Shared, peer: PeerId, mut stream: Stream) -> Result<()> {
+    shared.lock().await.admit_request(&peer.to_string())?;
+    let request = read_frame::<_, LanInviteRequest>(&mut stream).await?;
+    let response = handle_lan_invite(shared, peer, request)
+        .await
+        .unwrap_or(LanInviteResponse::Unavailable);
+    write_frame(&mut stream, &response).await?;
+    stream.close().await?;
+    Ok(())
+}
+
+async fn handle_lan_invite(
+    shared: Shared,
+    peer: PeerId,
+    request: LanInviteRequest,
+) -> Result<LanInviteResponse> {
+    ensure!(request.code.len() == 16, "Invalid LAN invitation");
+    let mut e = shared.lock().await;
+    e.expire_lan_invites();
+    let invite = e.lan_invites.get(&request.code).context("Access denied")?;
+    let invitation = invite.invitation.clone();
+    let record = invite.record.clone();
+    crate::lan_invite::verify(&invitation, &request.code, e.key.public().to_peer_id())?;
+    let response = if let Some(name) = request.name {
+        handle_join(&mut e, peer, &invitation, name, &record)?
+    } else {
+        ensure!(
+            e.persisted.active == Some(invitation.workspace_id)
+                && record.workspace_id == invitation.workspace_id
+                && record.token_hash == digest(invitation.token.as_bytes())
+                && record.expires_at > now()
+                && record
+                    .approved_peer
+                    .as_deref()
+                    .is_none_or(|approved| approved == peer.to_string()),
+            "Access denied"
+        );
+        if let Some(approved) = &record.approved_peer {
+            ensure!(
+                e.persisted
+                    .workspaces
+                    .get(&invitation.workspace_id)
+                    .is_some_and(|workspace| workspace.snapshot.contains(approved)),
+                "Access denied"
+            );
+        }
+        // A code-only probe reveals the owner commitment, never a roster or
+        // workspace secret, and does not create an approval request.
+        Response::Waiting
+    };
+    Ok(LanInviteResponse::Found {
+        invitation: Box::new(invitation),
+        response,
+    })
 }
 
 pub async fn serve_control(shared: Shared, peer: PeerId, mut stream: Stream) -> Result<()> {
@@ -1330,6 +1784,57 @@ async fn serve_contacts(shared: Shared, peer: PeerId, mut stream: Stream) -> Res
     stream.close().await?;
     Ok(())
 }
+fn handle_join(
+    e: &mut crate::engine::Engine,
+    peer: PeerId,
+    invitation: &Invitation,
+    name: String,
+    invite: &InviteRecord,
+) -> Result<Response> {
+    validate_label(&name)?;
+    let hash = digest(invitation.token.as_bytes());
+    ensure!(
+        invitation.version == VERSION
+            && invitation.token.len() <= 64
+            && invitation.owner_peer_id == e.peer()
+            && e.persisted.active == Some(invitation.workspace_id)
+            && invite.workspace_id == invitation.workspace_id
+            && invite.token_hash == hash
+            && invite.expires_at > now(),
+        "Access denied"
+    );
+    if let Some(approved) = &invite.approved_peer {
+        ensure!(*approved == peer.to_string(), "Access denied");
+        let workspace = e
+            .persisted
+            .workspaces
+            .get(&invitation.workspace_id)
+            .context("Access denied")?;
+        ensure!(workspace.snapshot.contains(approved), "Access denied");
+        return Ok(Response::Approved {
+            workspace: workspace.clone(),
+        });
+    }
+    ensure!(
+        e.pending.len() < 32 || e.pending.contains_key(&peer.to_string()),
+        "Access denied"
+    );
+    ensure!(peer.as_ref().code() == 0, "Unsupported peer identity");
+    let public = libp2p::identity::PublicKey::try_decode_protobuf(peer.as_ref().digest())?;
+    ensure!(public.to_peer_id() == peer, "Access denied");
+    let pending = crate::engine::Pending {
+        peer_id: peer.to_string(),
+        name,
+        workspace_id: invitation.workspace_id,
+        token_hash: hash,
+        fingerprint: digest(&public.encode_protobuf()),
+        requested_at: now(),
+    };
+    e.pending.insert(peer.to_string(), pending);
+    e.emit();
+    Ok(Response::Waiting)
+}
+
 pub async fn handle_control(shared: Shared, peer: PeerId, request: Request) -> Result<Response> {
     let mut e = shared.lock().await;
     match request {
@@ -1354,36 +1859,7 @@ pub async fn handle_control(shared: Shared, peer: PeerId, request: Request) -> R
                 })
                 .context("Access denied")?
                 .clone();
-            if let Some(approved) = invite.approved_peer {
-                ensure!(approved == peer.to_string(), "Access denied");
-                let workspace = e
-                    .persisted
-                    .workspaces
-                    .get(&invitation.workspace_id)
-                    .context("Access denied")?;
-                ensure!(workspace.snapshot.contains(&approved), "Access denied");
-                return Ok(Response::Approved {
-                    workspace: workspace.clone(),
-                });
-            }
-            ensure!(
-                e.pending.len() < 32 || e.pending.contains_key(&peer.to_string()),
-                "Access denied"
-            );
-            ensure!(peer.as_ref().code() == 0, "Unsupported peer identity");
-            let public = libp2p::identity::PublicKey::try_decode_protobuf(peer.as_ref().digest())?;
-            ensure!(public.to_peer_id() == peer, "Access denied");
-            let pending = crate::engine::Pending {
-                peer_id: peer.to_string(),
-                name,
-                workspace_id: invitation.workspace_id,
-                token_hash: hash,
-                fingerprint: digest(&public.encode_protobuf()),
-                requested_at: now(),
-            };
-            e.pending.insert(peer.to_string(), pending);
-            e.emit();
-            Ok(Response::Waiting)
+            handle_join(&mut e, peer, &invitation, name, &invite)
         }
         Request::Catalog { snapshot, offset } => {
             let current = e.authorize(&peer.to_string(), &snapshot)?;
@@ -1518,6 +1994,17 @@ async fn serve_file(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+#[path = "network_lan_invite_tests.rs"]
+mod lan_invite_tests;
+
+#[cfg(all(test, windows))]
+pub(crate) async fn occupy_receive_slots_for_test(
+    node: &Node,
+) -> Result<tokio::sync::OwnedSemaphorePermit> {
+    Ok(node.limits.receive.clone().acquire_many_owned(2).await?)
 }
 
 #[cfg(all(test, windows))]

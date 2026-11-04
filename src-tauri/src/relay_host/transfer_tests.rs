@@ -434,6 +434,32 @@ async fn circuit_lifetime_closure_fails_without_committing() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn relay_loss_while_receive_is_queued_keeps_relay_recovery_guidance() -> Result<()> {
+    let mut session = Session::start(config(), false).await?;
+    let result = async {
+        let _occupied = crate::network::occupy_receive_slots_for_test(&session.nodes[1]).await?;
+        let (id, output) = session.download("queued-relay.bin", 1024 * 1024).await?;
+        {
+            let e = session.member.lock().await;
+            ensure!(
+                e.transfers[&id].bytes == 0,
+                "Queued receive already read payload"
+            );
+            ensure!(
+                e.persisted.partials.is_empty(),
+                "Queued receive already created a partial"
+            );
+        }
+        session.stop.cancel();
+        session.failed_safely(id, &output).await?;
+        Ok(())
+    }
+    .await;
+    session.close().await?;
+    result
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn relay_shutdown_during_transfer_never_leaves_a_completed_file() -> Result<()> {
     let mut session = Session::start(config(), false).await?;
     let result = async {
