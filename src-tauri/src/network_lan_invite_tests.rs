@@ -537,7 +537,7 @@ async fn lan_invite_joins_after_approval_rejects_replay_and_discards_cancelled_a
             }
         ));
         assert!(apply_lan_response(
-            &mut outsider.lock().await,
+            &mut *outsider.lock().await,
             owner_peer,
             &cancelled_code,
             deadline,
