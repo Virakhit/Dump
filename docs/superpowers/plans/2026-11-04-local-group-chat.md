@@ -35,8 +35,10 @@ are stored in the existing protected state and streamed to the React interface.
    and real QUIC integration tests.
 3. [x] Interface: Group chat tab, scoped drafts, sender/time/history, UTF-8 limit,
    IME-safe Enter/Shift+Enter handling, per-message delivery feedback, existing style.
-4. [ ] Documentation and verification: local development/use instructions,
+4. [x] Documentation and verification: local development/use instructions,
    build/test evidence, focused independent review, and a reviewable feature branch.
+   The recorded evidence distinguishes passing chat checks from relay
+   test timeouts and leaves physical LAN/native-window acceptance explicit.
 
 ## Environment
 

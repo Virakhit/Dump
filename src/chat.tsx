@@ -122,7 +122,7 @@ export function ChatPanel({ workspace, workspaceName, peerId, messages, draft, e
     </div>
     <form className="chat-composer" onSubmit={event => { event.preventDefault(); submit(); }}>
       <label htmlFor="chat-message">Message {workspaceName}</label>
-      <textarea id="chat-message" rows={3} placeholder={canSend ? 'Write a message…' : 'You must be a member to send messages.'} value={draft} disabled={!canSend || pending} aria-describedby={`chat-compose-hint chat-byte-count${error ? ' chat-compose-error' : ''}`} aria-invalid={oversize || !!error} onChange={event => onDraftChange(event.target.value)} onKeyDown={event => {
+      <textarea id="chat-message" rows={3} placeholder={canSend ? 'Write a message…' : 'You must be a member to send messages.'} value={draft} disabled={!canSend} aria-describedby={`chat-compose-hint chat-byte-count${error ? ' chat-compose-error' : ''}`} aria-invalid={oversize || !!error} onChange={event => onDraftChange(event.target.value)} onKeyDown={event => {
         if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing && event.nativeEvent.keyCode !== 229) {
           event.preventDefault(); submit();
         }

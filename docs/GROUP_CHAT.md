@@ -92,7 +92,16 @@ That run then stopped at the existing LAN file-transfer test's source-file edit
 with Windows sharing violation 32; it was not a fully green suite. The subsequent
 test adjustment waits for the serving side's source handle to be released before
 the edit, preserving the stale-manifest assertions. The focused chat CI step also
-enables the desktop feature to verify the Tauri command integration.
+compiles the desktop feature, including the Tauri command registration; it does
+not drive a native WebView or exercise the frontend-to-native IPC boundary.
+
+The [Windows run for 9b4f657](https://github.com/Virakhit/Dump/actions/runs/41794494942)
+then passed all three chat integration tests with the desktop feature enabled,
+as well as all four chat unit tests in the core suite. The full core suite stopped
+at three relay file-transfer timeouts. One of those lifecycle timeouts also
+appeared on the unmodified main branch; the full suite was not green in that run.
+Independent checks now continue after a failed test so that LAN, desktop,
+dependency, updater, and lint results remain visible without hiding failures.
 
 Local frontend checks exercised UTF-8 boundaries, receipt labels, literal text
 rendering, IME input, duplicate submission, workspace-switch draft isolation, and
