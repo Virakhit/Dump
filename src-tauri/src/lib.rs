@@ -6,6 +6,9 @@ mod desktop;
 pub mod engine;
 mod holepunch;
 mod identify;
+pub mod lan_invite;
+#[cfg(test)]
+mod lan_invite_tests;
 pub mod model;
 pub mod network;
 mod reachability;
