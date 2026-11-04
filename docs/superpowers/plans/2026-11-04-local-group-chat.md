@@ -27,13 +27,13 @@ are stored in the existing protected state and streamed to the React interface.
 
 ## Tasks
 
-1. [ ] Model and persistence: signed `ChatMessage`, local `StoredChat` and typed
+1. [x] Model and persistence: signed `ChatMessage`, local `StoredChat` and typed
    delivery state, backward-compatible persisted history, bounds/deduplication,
    engine compose/receive/finish operations and tests.
-2. [ ] Transport and desktop: `/dump/chat/1`, bounded incoming/fan-out, explicit
+2. [x] Transport and desktop: `/dump/chat/1`, bounded incoming/fan-out, explicit
    workspace send command, durable receipt validation, cancellation/revalidation,
    and real QUIC integration tests.
-3. [ ] Interface: Group chat tab, scoped drafts, sender/time/history, UTF-8 limit,
+3. [x] Interface: Group chat tab, scoped drafts, sender/time/history, UTF-8 limit,
    IME-safe Enter/Shift+Enter handling, per-message delivery feedback, existing style.
 4. [ ] Documentation and verification: local development/use instructions,
    build/test evidence, focused independent review, and a reviewable feature branch.

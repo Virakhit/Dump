@@ -78,5 +78,25 @@ checks have already run:
 - Receive a file while chatting to check that both functions remain usable.
 
 For automated checks use `npm run build` and `npm run test:core` on Windows.
+The focused chat command is `cargo test --manifest-path src-tauri/Cargo.toml --locked --test chat`;
+it also compiles the desktop feature used by the application.
 The chat integration tests use real authenticated QUIC over loopback. They do not
 replace multi-device LAN discovery or Windows firewall acceptance checks.
+
+## Recorded verification
+
+The [Windows run for a0e9087](https://github.com/Virakhit/Dump/actions/runs/41792942659)
+passed frontend build, Rust formatting, all three chat integration tests, all 37
+core unit tests (including four new chat tests), and all four connectivity tests.
+That run then stopped at the existing LAN file-transfer test's source-file edit
+with Windows sharing violation 32; it was not a fully green suite. The subsequent
+test adjustment waits for the serving side's source handle to be released before
+the edit, preserving the stale-manifest assertions. The focused chat CI step also
+enables the desktop feature to verify the Tauri command integration.
+
+Local frontend checks exercised UTF-8 boundaries, receipt labels, literal text
+rendering, IME input, duplicate submission, workspace-switch draft isolation, and
+draft preservation after a failed send command in a React/JSDOM harness. The native
+Windows interface and physical multi-device LAN checklist above remain manual
+acceptance checks. See the current checks on [PR #2](https://github.com/Virakhit/Dump/pull/2)
+for the result on the latest revision.
