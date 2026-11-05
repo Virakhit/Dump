@@ -2166,6 +2166,10 @@ async fn serve_file(
 mod lan_invite_tests;
 
 #[cfg(all(test, windows))]
+#[path = "network_process_invite_tests.rs"]
+mod process_invite_tests;
+
+#[cfg(all(test, windows))]
 pub(crate) async fn occupy_receive_slots_for_test(
     node: &Node,
 ) -> Result<tokio::sync::OwnedSemaphorePermit> {
