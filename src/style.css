@@ -2,6 +2,7 @@
 :root .update-button{width:100%;justify-content:space-between;font-size:11px;padding:10px;margin-bottom:12px}.update-button small{color:var(--muted);font-weight:400}
 
 .chat-panel{margin-bottom:28px}
+dialog .check input{width:auto;margin:0;flex-shrink:0}
 .chat-heading{display:flex;align-items:center;justify-content:space-between;gap:16px}
 .chat-heading>span{font-size:10px;color:var(--muted);background:#eeecf8;border-radius:5px;padding:5px 8px}
 .chat-scope{font-size:11px;line-height:1.7;color:var(--muted);margin:10px 0 16px}

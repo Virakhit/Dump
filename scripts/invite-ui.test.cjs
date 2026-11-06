@@ -96,6 +96,37 @@ test('owner can review a request while the invite dialog is still open', async (
   } finally { await app.close(); }
 });
 
+test('owner can approve directly inside the invitation dialog after checking the fingerprint', async () => {
+  const app = await mount(state());
+  try {
+    await app.click(button(app.document, 'Invite a friend'));
+    await app.emit(state({ pending: [pending], invite_url: 'dump://lan/AAAAAAAAAAAAAAAA' }));
+    const dialog = app.document.querySelector('dialog[open]');
+    const approve = button(dialog, 'Approve device');
+    assert.ok(approve, 'approval must be available inside the open invitation dialog');
+    assert.ok(approve.disabled);
+    assert.match(dialog.textContent, /verified-test-fingerprint/);
+    assert.equal(app.actions.some(action => action.type === 'approve'), false);
+    await app.click(dialog.querySelector('.request-card input[type=checkbox]'));
+    await app.click(button(dialog, 'Approve device'));
+    assert.deepEqual(app.actions.at(-1), { type: 'approve', peer_id: pending.peer_id });
+    await app.emit(state({ invite_url: 'dump://lan/AAAAAAAAAAAAAAAA' }));
+    assert.equal(button(dialog, 'Approve device'), undefined);
+  } finally { await app.close(); }
+});
+
+test('owner Members explains when no join request has arrived', async () => {
+  const app = await mount(state());
+  try {
+    await app.click(app.document.querySelector('#members-tab'));
+    assert.match(app.document.querySelector('#workspace-panel').textContent, /No join requests have reached this workspace/);
+    assert.equal(button(app.document, 'Approve device'), undefined);
+    await app.emit(state({ pending: [pending] }));
+    assert.doesNotMatch(app.document.querySelector('#workspace-panel').textContent, /No join requests have reached this workspace/);
+    assert.ok(button(app.document, 'Approve device').disabled);
+  } finally { await app.close(); }
+});
+
 test('incoming requests remain visible from Chat and disappear when the owner list clears', async () => {
   const app = await mount(state());
   try {
