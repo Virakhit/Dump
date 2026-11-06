@@ -6,12 +6,14 @@ The published 0.1.2 installer predates the source fixes below. The 0.1.3
 candidate includes those fixes and shows the requester's name, fingerprint,
 Approve device and Reject controls directly inside the invitation dialog.
 Approval still requires checking the fingerprint confirmation. The same
-request card is used in Members. When no request has arrived, the owner's
+request card is used in Members. Successful approval or rejection closes the
+invitation dialog so a consumed or revoked link cannot be copied from it. A
+failed action leaves the request and error visible for retry. When no request has arrived, the owner's
 Members panel explains that there is nothing to approve yet and asks both
 devices to keep Dump open on the same LAN with the invited workspace selected.
 
-Local TypeScript/Vite build and all seven React/JSDOM invitation cases pass.
-The two new cases failed before implementation. Local Rust testing cannot
+Local TypeScript/Vite build and all nine React/JSDOM invitation cases pass.
+The new UI behaviors were checked with failing regressions before implementation. Local Rust testing cannot
 link because this machine's Build Tools installation lacks the C++ workload
 (`link.exe`). The pull request's Windows checks run core, desktop and updater
 tests; after they pass, the installer-preview job builds a manually installable

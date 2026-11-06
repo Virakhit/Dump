@@ -83,6 +83,12 @@ function App() {
     try { await invoke(command, args); return true; } catch (e) { setError(String(e)); return false; } finally { setBusy(false); }
   }
   const act = (action: Record<string, unknown>) => call('dispatch', { action });
+  async function resolveJoinRequest(type: 'approve' | 'reject', peerId: string) {
+    if (await act({ type, peer_id: peerId })) {
+      setVerified(current => ({ ...current, [peerId]: false }));
+      setModal(current => current === 'invite' ? null : current);
+    }
+  }
   function open(kind: ModalKind) { setValue(kind === 'name' ? view.device_name : ''); setCopied(false); if (kind === 'network') { setNetwork(view.network); setNetworkSaved(false); } setModal(kind); }
   async function copy(text: string) { try { await navigator.clipboard.writeText(text); setCopied(true); } catch { setError('Could not copy. Select and copy the text manually.'); } }
   async function submit(e: React.FormEvent) {
@@ -116,7 +122,7 @@ function App() {
   const files = view.files.filter(f => f.manifest.name.toLowerCase().includes(query.toLowerCase()));
   const shownError = error || view.last_error;
 
-  const renderJoinRequest = (p: View['pending'][number]) => <article className="request-card" key={p.peer_id}><strong>{p.name} wants to join</strong><p>Compare this fingerprint with the requester through a trusted conversation. A name alone does not verify identity.</p><code>{p.fingerprint}</code><label className="check"><input type="checkbox" checked={verified[p.peer_id] ?? false} onChange={e => setVerified({ ...verified, [p.peer_id]: e.target.checked })} /> I compared this device’s fingerprint.</label><div><button className="primary" disabled={busy || !verified[p.peer_id]} onClick={() => void act({ type: 'approve', peer_id: p.peer_id })}>Approve device</button><button disabled={busy} onClick={() => void act({ type: 'reject', peer_id: p.peer_id })}>Reject</button></div></article>;
+  const renderJoinRequest = (p: View['pending'][number]) => <article className="request-card" key={p.peer_id}><strong>{p.name} wants to join</strong><p>Compare this fingerprint with the requester through a trusted conversation. A name alone does not verify identity.</p><code>{p.fingerprint}</code><label className="check"><input type="checkbox" checked={verified[p.peer_id] ?? false} onChange={e => setVerified({ ...verified, [p.peer_id]: e.target.checked })} /> I compared this device’s fingerprint.</label><div><button className="primary" disabled={busy || !verified[p.peer_id]} onClick={() => void resolveJoinRequest('approve', p.peer_id)}>Approve device</button><button disabled={busy} onClick={() => void resolveJoinRequest('reject', p.peer_id)}>Reject</button></div></article>;
 
   return <div className="app">
     <aside className="sidebar">
