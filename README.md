@@ -3,15 +3,15 @@
 A Windows desktop app for sharing files directly with trusted people on the same local network.
 Files stay on the owner's device until another member receives them. No account, cloud file storage, or Dump backend is required.
 
-**Status:** v0.1.2-alpha.1. The initial target is Windows 11 x64 and small groups of friends or teammates. See [verification results](docs/VERIFICATION.md) for tested behavior and outstanding release checks.
+**Status:** v0.1.3-alpha.1. The initial target is Windows 11 x64 and small groups of friends or teammates. See [verification results](docs/VERIFICATION.md) for tested behavior and outstanding release checks.
 
 ## Install on Windows
 
-**[Download the Windows installer](https://github.com/Virakhit/Dump/releases/download/v0.1.2-alpha.1/Dump_0.1.2_x64-setup.exe)** — Windows x64.
+**[Download the Windows installer](https://github.com/Virakhit/Dump/releases/download/v0.1.3-alpha.1/Dump_0.1.3_x64-setup.exe)** — Windows x64.
 
-[Release notes and updater signature](https://github.com/Virakhit/Dump/releases/tag/v0.1.2-alpha.1). Download the `.exe` installer from the release assets; the source-code ZIP is for developers.
+[Release notes and updater signature](https://github.com/Virakhit/Dump/releases/tag/v0.1.3-alpha.1). Download the `.exe` installer from the release assets; the source-code ZIP is for developers.
 
-1. Download and run `Dump_0.1.2_x64-setup.exe` on each Windows device.
+1. Download and run `Dump_0.1.3_x64-setup.exe` on each Windows device.
 2. Click **Next**, choose an installation folder, and click **Install**. Dump installs for the current Windows user.
 3. On the final wizard screen, leave **Run Dump** selected and click **Finish**.
 4. Later, open **Dump** from the Windows Start Menu or the desktop shortcut if you chose to create one.
@@ -32,7 +32,7 @@ Updates follow published GitHub releases, including alpha previews. A draft rele
 2. Optionally set your device name from the identity panel.
 3. Create a workspace and copy an invitation to your friend through your existing conversation.
 4. Your friend opens the invite or pastes it into **Join with an invite**.
-5. Compare the friend's fingerprint through a trusted conversation, then approve their device in **Members**.
+5. Compare the friend's fingerprint through a trusted conversation, then approve their device in the invitation dialog or **Members**.
 6. Drop files into the workspace or choose them with the file picker.
 7. Your friend selects **Receive** and chooses a destination folder.
 
@@ -40,9 +40,9 @@ The owner must be online with the relevant workspace selected to approve joins. 
 
 Sharing does not duplicate the original file. Files being hashed or served are temporarily opened read-only with write/delete sharing disabled. Changed files receive a new signed manifest; unavailable files disappear from the active catalog. Empty files and files larger than 4 GiB use the same streaming path.
 
-## Group chat (source build)
+## Group chat
 
-Each workspace now has a **Group chat** tab. Run this source build on each
+Each workspace has a **Group chat** tab. Run Dump 0.1.3 on each
 Windows device, join and approve members as usual, then select the same workspace
 on the same LAN. Type a message and press **Enter** or **Send**; **Shift+Enter**
 adds a new line. No chat server or Internet account is needed.
@@ -57,8 +57,6 @@ latest 500 messages per workspace are retained, with a device-wide cap of 2,000.
 Messages support multiline Unicode text up to 4,096 UTF-8 bytes. The workspace
 owner can be offline after membership approval. See the [group chat guide](docs/GROUP_CHAT.md)
 for local setup, delivery states, and a multi-device check.
-
-The published installer above does not include this source-only feature.
 
 ## Privacy and limits
 
@@ -91,9 +89,9 @@ Check the network's approved firewall configuration if discovery or connections 
 
 Building from source is optional. See the [development guide](docs/DEVELOPMENT.md) for prerequisites, development commands, installer builds, and tests.
 
-**Source-only invitation change:** **Invite a friend** now creates a 27-character LAN link: `dump://lan/` followed by a 16-character base64url code. The code is a commitment derived from the full random invitation token, workspace, and owner identity; the recipient verifies it against the authenticated owner. It works only on the same local network, expires after ten minutes, and is valid for one explicitly approved device. The owner still compares the requester's fingerprint before approving them. The invitation exists only in memory: closing or restarting Dump, or switching the owner's selected workspace, ends it. LAN discovery and joining need no Internet resolver or connection.
+**Invite a friend** creates a 27-character LAN link: `dump://lan/` followed by a 16-character base64url code. The code is a commitment derived from the full random invitation token, workspace, and owner identity; the recipient verifies it against the authenticated owner. It works only on the same local network, expires after ten minutes, and is valid for one explicitly approved device. The owner still compares the requester's fingerprint before approving them. The invitation exists only in memory: closing or restarting Dump, or switching the owner's selected workspace, ends it. LAN discovery and joining need no Internet resolver or connection.
 
-For another network, choose **Use a full link for another network** in the invitation dialog. This creates the existing `dump://join/<base64url(JSON invitation)>` link, with its 24-hour expiry and optional signed Internet contact. Older JSON invitations remain accepted. Both devices need a supporting source build to use the new short LAN link; the published 0.1.1 installer cannot open it. The release instructions and limits above describe that published installer. This source change does not publish an updated installer.
+For another network, choose **Use a full link for another network** in the invitation dialog. This creates the existing `dump://join/<base64url(JSON invitation)>` link, with its 24-hour expiry and optional signed Internet contact. Older JSON invitations remain accepted. Use Dump 0.1.3 on both devices for short LAN links.
 
 The v0.2 Internet milestone is implemented in source and locally tested: Identify, bounded direct dialing, AutoNAT v2, authenticated TCP fallback, end-peer encrypted relay circuits, DCUtR, opt-in forwarding with resource ceilings, signed invitation contacts and authorized contact exchange. Known LAN/direct routes take priority; direct upgrades preserve active relay transfers. Legacy device identities, signed workspaces and LAN invitations remain usable; Internet invites with stale hosted-circuit locators require refresh. There is no default or mandatory Dump relay.
 
@@ -103,7 +101,7 @@ AutoNAT can revalidate candidates during an open session without disconnecting t
 
 To test different-network invitations, both devices need this source build and the owner needs a reachable direct route or a configured trusted relay. Open **Network settings > Advanced connectivity**, add a reachable relay locator, restart Dump, then select **Invite a friend > Use a full link for another network** after its reservation is ready. The recipient opens it and follows the usual fingerprint/approval/share/receive flow. Raw addresses stay in advanced settings. For community hosting, see the [opt-in role and setup steps](docs/PROTOCOL.md#opt-in-hosting-stage-5).
 
-The installer linked above remains the LAN-only 0.1.1 release. No new Internet installer has been built or published. The historical local matrix covers the twelve Internet regression cases. The stabilization evidence is recorded separately; local protocol exchanges do not establish success through actual NAT/CGNAT/firewalls. See the [verification matrix](docs/VERIFICATION.md) and [remaining acceptance gates](docs/PLAN.md). Before packaging this source, bump its app version as described in the development guide.
+The historical local matrix covers the twelve Internet regression cases. The stabilization evidence is recorded separately; local protocol exchanges do not establish success through actual NAT/CGNAT/firewalls. See the [verification matrix](docs/VERIFICATION.md) and [remaining acceptance gates](docs/PLAN.md). Before packaging this source, bump its app version as described in the development guide.
 
 ## Documentation
 
