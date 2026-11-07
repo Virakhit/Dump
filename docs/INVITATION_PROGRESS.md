@@ -1,5 +1,32 @@
 # Invitation visibility and progress hotfix candidate
 
+## 0.1.3 candidate (6 November 2026)
+
+The published 0.1.2 installer predates the source fixes below. The 0.1.3
+candidate includes those fixes and shows the requester's name, fingerprint,
+Approve device and Reject controls directly inside the invitation dialog.
+Approval still requires checking the fingerprint confirmation. The same
+request card is used in Members. Successful approval or rejection closes the
+invitation dialog so a consumed or revoked link cannot be copied from it. A
+failed action leaves the request and error visible for retry. When no request has arrived, the owner's
+Members panel explains that there is nothing to approve yet and asks both
+devices to keep Dump open on the same LAN with the invited workspace selected.
+
+Local TypeScript/Vite build and all nine React/JSDOM invitation cases pass.
+The new UI behaviors were checked with failing regressions before implementation. Local Rust testing cannot
+link because this machine's Build Tools installation lacks the C++ workload
+(`link.exe`). The pull request's Windows checks run core, desktop and updater
+tests; after they pass, the installer-preview job builds a manually installable
+0.1.3 installer and SHA-256 checksum in the Dump-Windows-preview artifact.
+That preview does not change the published updater feed and has no updater
+signature. The normal release workflow still requires the original signing key.
+
+Install the candidate on both devices, create a fresh LAN invitation, keep the
+owner's invited workspace selected, then compare fingerprints and approve in
+the invitation dialog or Members. Physical two-machine discovery and the
+reported incident remain unverified until this flow succeeds on the affected
+LAN. The historical results below describe the earlier source candidate.
+
 The 0.1.2 interface says it is waiting for owner approval as soon as joining starts, before discovery or acknowledgment. An arriving owner request is visible only on Members and can be obscured by the invitation dialog. This candidate distinguishes discovery/contact/request/acknowledgment and adds an owner notice with a Review requests shortcut, including inside the invitation dialog. Requests are never approved automatically; fingerprint comparison remains required.
 
 The user-reported absence of an owner request on a physical LAN is not claimed resolved by this UI change. The owner's screenshot was already on Members. Check that the owner keeps the invitation's workspace selected, the link is fresh and current, and approved network policy permits discovery and connections. A selected pre-existing workspace on the joining machine does not identify the invitation target: the new workspace becomes active after approval.

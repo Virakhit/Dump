@@ -17,7 +17,7 @@ function state(overrides = {}) {
     online: [], files: [], chat_messages: [], pending: [], preparing: [], joining: false, join_stage: null, network_status: 'LAN discovery is running', relay_peers: [], transfers: [], invite_url: null, last_error: null,
     network: { help_network: false, public_addresses: [], relays: [] }, ...overrides };
 }
-async function mount(initial) {
+async function mount(initial, { failAction } = {}) {
   const dom = new JSDOM('<div id="root"></div>', { url: 'http://localhost' });
   global.window = dom.window; global.document = dom.window.document;
   global.HTMLElement = dom.window.HTMLElement; global.IS_REACT_ACT_ENVIRONMENT = true;
@@ -31,6 +31,7 @@ async function mount(initial) {
       if (command === 'get_state') return current;
       if (command === 'dispatch') {
         actions.push(args.action);
+        if (args.action.type === failAction) throw new Error('Request could not be processed');
         if (args.action.type === 'create_lan_invite') {
           current = { ...current, invite_url: 'dump://lan/AAAAAAAAAAAAAAAA' };
           stateListener({ payload: current });
@@ -92,6 +93,62 @@ test('owner can review a request while the invite dialog is still open', async (
     await app.click(button(dialog, 'Review requests'));
     assert.equal(app.document.querySelector('dialog[open]'), null);
     assert.equal(app.document.querySelector('#members-tab').getAttribute('aria-selected'), 'true');
+    assert.ok(button(app.document, 'Approve device').disabled);
+  } finally { await app.close(); }
+});
+
+test('owner can approve directly inside the invitation dialog after checking the fingerprint', async () => {
+  const app = await mount(state());
+  try {
+    await app.click(button(app.document, 'Invite a friend'));
+    await app.emit(state({ pending: [pending], invite_url: 'dump://lan/AAAAAAAAAAAAAAAA' }));
+    const dialog = app.document.querySelector('dialog[open]');
+    const approve = button(dialog, 'Approve device');
+    assert.ok(approve, 'approval must be available inside the open invitation dialog');
+    assert.ok(approve.disabled);
+    assert.match(dialog.textContent, /verified-test-fingerprint/);
+    assert.equal(app.actions.some(action => action.type === 'approve'), false);
+    await app.click(dialog.querySelector('.request-card input[type=checkbox]'));
+    await app.click(button(dialog, 'Approve device'));
+    assert.deepEqual(app.actions.at(-1), { type: 'approve', peer_id: pending.peer_id });
+    assert.ok(!app.document.querySelector('dialog[open]'), 'a consumed invitation must not remain available to copy');
+    await app.emit(state({ invite_url: 'dump://lan/AAAAAAAAAAAAAAAA' }));
+    assert.equal(button(app.document, 'Approve device'), undefined);
+  } finally { await app.close(); }
+});
+
+test('rejecting inside the invitation dialog hides the revoked link', async () => {
+  const app = await mount(state());
+  try {
+    await app.click(button(app.document, 'Invite a friend'));
+    await app.emit(state({ pending: [pending], invite_url: 'dump://lan/AAAAAAAAAAAAAAAA' }));
+    await app.click(button(app.document.querySelector('dialog[open]'), 'Reject'));
+    assert.deepEqual(app.actions.at(-1), { type: 'reject', peer_id: pending.peer_id });
+    assert.ok(!app.document.querySelector('dialog[open]'), 'a revoked invitation must not remain available to copy');
+  } finally { await app.close(); }
+});
+
+test('a failed rejection keeps the request dialog open for retry', async () => {
+  const app = await mount(state(), { failAction: 'reject' });
+  try {
+    await app.click(button(app.document, 'Invite a friend'));
+    await app.emit(state({ pending: [pending], invite_url: 'dump://lan/AAAAAAAAAAAAAAAA' }));
+    await app.click(button(app.document.querySelector('dialog[open]'), 'Reject'));
+    const dialog = app.document.querySelector('dialog[open]');
+    assert.ok(dialog);
+    assert.match(dialog.textContent, /Request could not be processed/);
+    assert.ok(button(dialog, 'Reject'));
+  } finally { await app.close(); }
+});
+
+test('owner Members explains when no join request has arrived', async () => {
+  const app = await mount(state());
+  try {
+    await app.click(app.document.querySelector('#members-tab'));
+    assert.match(app.document.querySelector('#workspace-panel').textContent, /No join requests have reached this workspace/);
+    assert.equal(button(app.document, 'Approve device'), undefined);
+    await app.emit(state({ pending: [pending] }));
+    assert.doesNotMatch(app.document.querySelector('#workspace-panel').textContent, /No join requests have reached this workspace/);
     assert.ok(button(app.document, 'Approve device').disabled);
   } finally { await app.close(); }
 });

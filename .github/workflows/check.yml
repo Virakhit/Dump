@@ -37,3 +37,35 @@ jobs:
         run: node --test scripts/publish-update.test.cjs
       - if: ${{ !cancelled() }}
         run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked -- -D warnings
+  installer-preview:
+    if: github.event_name == 'pull_request'
+    needs: check
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: rustup toolchain install stable --profile minimal
+      - run: npm ci
+      - name: Build manually installable preview
+        shell: pwsh
+        run: |
+          $config = @{ bundle = @{ createUpdaterArtifacts = $false } } | ConvertTo-Json -Depth 3 -Compress
+          $config | Set-Content -LiteralPath preview-config.json -Encoding utf8
+          npm run tauri build -- --config preview-config.json -- --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $installers = @(Get-ChildItem -LiteralPath src-tauri/target/release/bundle/nsis -Filter '*-setup.exe')
+          if ($installers.Count -ne 1) { throw 'Expected one preview installer.' }
+          $installer = $installers[0]
+          $checksum = (Get-FileHash -LiteralPath $installer.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$checksum  $($installer.Name)" | Set-Content -LiteralPath "$($installer.FullName).sha256" -Encoding ascii
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Dump-Windows-preview
+          path: |
+            src-tauri/target/release/bundle/nsis/*-setup.exe
+            src-tauri/target/release/bundle/nsis/*-setup.exe.sha256
+          if-no-files-found: error
+          retention-days: 14
