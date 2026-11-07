@@ -1,15 +1,15 @@
 {
-  "version": "0.1.2",
+  "version": "0.1.3",
   "notes": "Windows x64 installer with signed in-app updates. Preview releases remain alpha; Windows publisher signing and physical-machine validation are still pending.",
-  "pub_date": "2026-11-04T10:19:40.572Z",
+  "pub_date": "2026-11-07T18:35:59.600Z",
   "platforms": {
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUbVUxTWZUWWgyZDFndmZRZ0tkZEZ2UjJSbzQyVTUzdzlKT0hibmFMd0xvM2M5UzQ1WW1jQUo0bjBrSk13OTlRaGtNTGZYSVZZRy9CcVloa1VGcHVzcGQ0N1R4dlBlS1FvPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkzNzg3NTY1CWZpbGU6RHVtcF8wLjEuMl94NjQtc2V0dXAuZXhlCXZlcnNpb246MC4xLjIKbHNNSnZPNktxOWRIRnlaTEFxdkNpQ040cEh0c2ozT2U3Uk9xVzNyblJOVWo3S25CRzZ1OUxYYWhmNXcvUm9hNkFLc3N1a2d1ajg2a3BidE95aktzQXc9PQo=",
-      "url": "https://github.com/Virakhit/Dump/releases/download/v0.1.2-alpha.1/Dump_0.1.2_x64-setup.exe"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUbVUxTWZUWWgyZDcwZ0txek5UT2FFQkc4SWo4TDRIUFpkcGpidzZnOGgyYXFtSUhzdWtNZEVuRWhReks0ZWgwVE5BaHZRZ1RTUnd0U2NQbTUvY0tQSFI3Ym1FY3pQTGdZPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzk0MDc2NTQ5CWZpbGU6RHVtcF8wLjEuM194NjQtc2V0dXAuZXhlCXZlcnNpb246MC4xLjMKamRDeHFlRnpOVzBlVnRJdEZCYmEvYUU1ZjI3NzIwcmovbkxMQnd5dm5haDJCYUV4OXZKMVNFa0djcktmSW5nRXRtV21PcHViV21LbzBSMCttdkt4RGc9PQo=",
+      "url": "https://github.com/Virakhit/Dump/releases/download/v0.1.3-alpha.1/Dump_0.1.3_x64-setup.exe"
     },
     "windows-x86_64-nsis": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUbVUxTWZUWWgyZDFndmZRZ0tkZEZ2UjJSbzQyVTUzdzlKT0hibmFMd0xvM2M5UzQ1WW1jQUo0bjBrSk13OTlRaGtNTGZYSVZZRy9CcVloa1VGcHVzcGQ0N1R4dlBlS1FvPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkzNzg3NTY1CWZpbGU6RHVtcF8wLjEuMl94NjQtc2V0dXAuZXhlCXZlcnNpb246MC4xLjIKbHNNSnZPNktxOWRIRnlaTEFxdkNpQ040cEh0c2ozT2U3Uk9xVzNyblJOVWo3S25CRzZ1OUxYYWhmNXcvUm9hNkFLc3N1a2d1ajg2a3BidE95aktzQXc9PQo=",
-      "url": "https://github.com/Virakhit/Dump/releases/download/v0.1.2-alpha.1/Dump_0.1.2_x64-setup.exe"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUbVUxTWZUWWgyZDcwZ0txek5UT2FFQkc4SWo4TDRIUFpkcGpidzZnOGgyYXFtSUhzdWtNZEVuRWhReks0ZWgwVE5BaHZRZ1RTUnd0U2NQbTUvY0tQSFI3Ym1FY3pQTGdZPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzk0MDc2NTQ5CWZpbGU6RHVtcF8wLjEuM194NjQtc2V0dXAuZXhlCXZlcnNpb246MC4xLjMKamRDeHFlRnpOVzBlVnRJdEZCYmEvYUU1ZjI3NzIwcmovbkxMQnd5dm5haDJCYUV4OXZKMVNFa0djcktmSW5nRXRtV21PcHViV21LbzBSMCttdkt4RGc9PQo=",
+      "url": "https://github.com/Virakhit/Dump/releases/download/v0.1.3-alpha.1/Dump_0.1.3_x64-setup.exe"
     }
   }
 }
