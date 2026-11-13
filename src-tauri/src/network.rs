@@ -43,6 +43,33 @@ use tokio_util::task::TaskTracker;
 use uuid::Uuid;
 
 const CONTROL: StreamProtocol = StreamProtocol::new("/dump/control/1");
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct OverlayTestConfig {
+    pub listen: std::net::IpAddr,
+    pub remotes: BTreeMap<String, std::net::IpAddr>,
+}
+#[cfg(all(test, windows))]
+#[path = "network_overlay_tests.rs"]
+mod overlay_tests;
+
+#[path = "network_overlay.rs"]
+mod overlay_network;
+use overlay_network::{OverlayConnections, OverlayListeners};
+
+#[derive(Default)]
+struct StartConfig {
+    discovery: bool,
+    allow_loopback: bool,
+    #[cfg(test)]
+    overlay: Option<OverlayTestConfig>,
+}
+
+#[derive(Clone)]
+struct JoinAttemptContext {
+    epoch: u64,
+    overlay: Option<crate::overlay::OverlayContact>,
+}
 const FILE: StreamProtocol = StreamProtocol::new("/dump/file/1");
 const CONTACT: StreamProtocol = StreamProtocol::new("/dump/contact/1");
 const CHAT: StreamProtocol = StreamProtocol::new("/dump/chat/1");
@@ -104,6 +131,7 @@ struct Behaviour {
     // Check connection admission before other handlers allocate per-connection state.
     limits: connection_limits::Behaviour,
     streams: Streams,
+    overlay_streams: Streams,
     relay_streams: Streams,
     lan_streams: Streams,
     relay: relay::client::Behaviour,
@@ -462,6 +490,11 @@ pub struct Node {
     pub shared: Shared,
     pub control: Control,
     relay_control: Control,
+    overlay_control: Control,
+    overlay_scope: crate::overlay_routes::SharedOverlayScope,
+    tailscale_refresh: Arc<Mutex<()>>,
+    #[cfg(test)]
+    overlay_test: Option<Arc<OverlayTestConfig>>,
     lan_control: Control,
     dial: mpsc::Sender<Dial>,
     protocol_reports: mpsc::Sender<ProtocolReport>,
@@ -470,17 +503,49 @@ pub struct Node {
     pub diagnostics: watch::Receiver<Diagnostics>,
     pub reachability: watch::Receiver<Reachability>,
     pub relay_addresses: watch::Receiver<Vec<Multiaddr>>,
+    pub(crate) overlay_peers: watch::Receiver<BTreeSet<PeerId>>,
     limits: Arc<Limits>,
     pub shutdown: CancellationToken,
     #[cfg(test)]
     nat_confirmations: watch::Receiver<usize>,
 }
 impl Node {
+    #[cfg(all(test, windows))]
+    pub(crate) async fn start_overlay_test(
+        shared: Shared,
+        config: OverlayTestConfig,
+    ) -> Result<Self> {
+        Self::start_config(
+            shared,
+            StartConfig {
+                discovery: false,
+                allow_loopback: true,
+                overlay: Some(config),
+            },
+        )
+        .await
+    }
     pub async fn start(shared: Shared, discovery: bool) -> Result<Self> {
         Self::start_inner(shared, discovery, false).await
     }
     async fn start_inner(shared: Shared, discovery: bool, allow_loopback: bool) -> Result<Self> {
-        let allow_loopback = allow_loopback && cfg!(test);
+        Self::start_config(
+            shared,
+            StartConfig {
+                discovery,
+                allow_loopback,
+                #[cfg(test)]
+                overlay: None,
+            },
+        )
+        .await
+    }
+    async fn start_config(shared: Shared, config: StartConfig) -> Result<Self> {
+        let discovery = config.discovery;
+        let allow_loopback = config.allow_loopback && cfg!(test);
+        let overlay_scope = Arc::new(std::sync::RwLock::new(
+            crate::overlay_routes::OverlayScope::default(),
+        ));
         let key = shared.lock().await.key.clone();
         let peer = key.public().to_peer_id();
         let mdns = if discovery {
@@ -498,9 +563,10 @@ impl Node {
             .with_quic()
             .with_relay_client(noise::Config::new, yamux::Config::default)?
             .with_behaviour(|key, relay| Behaviour {
-                streams: Streams::new(false),
+                streams: Streams::new(false).with_overlay_scope(overlay_scope.clone()),
+                overlay_streams: Streams::overlay(overlay_scope.clone()),
                 relay_streams: Streams::new(true),
-                lan_streams: Streams::lan(allow_loopback),
+                lan_streams: Streams::lan(allow_loopback).with_overlay_scope(overlay_scope.clone()),
                 relay,
                 mdns: mdns.into(),
                 ping: ping::Behaviour::new(
@@ -550,11 +616,17 @@ impl Node {
         )?;
         let mut control = swarm.behaviour().streams.control();
         let mut relay_control = swarm.behaviour().relay_streams.control();
+        let mut overlay_control = swarm.behaviour().overlay_streams.control();
         let mut lan_control = swarm.behaviour().lan_streams.control();
         let mut lan_incoming = lan_control.accept(LAN_INVITE)?;
-        let mut incoming =
-            futures::stream::select(control.accept(CONTROL)?, relay_control.accept(CONTROL)?);
-        let mut files = futures::stream::select(
+        let mut incoming = futures::stream::select(
+            futures::stream::select(
+                control.accept(CONTROL)?.map(|(p, s)| (p, s, false)),
+                relay_control.accept(CONTROL)?.map(|(p, s)| (p, s, false)),
+            ),
+            overlay_control.accept(CONTROL)?.map(|(p, s)| (p, s, true)),
+        );
+        let legacy_files = futures::stream::select(
             control
                 .accept(FILE)?
                 .map(|(peer, stream)| (peer, stream, false)),
@@ -562,9 +634,39 @@ impl Node {
                 .accept(FILE)?
                 .map(|(peer, stream)| (peer, stream, true)),
         );
-        let mut contacts =
-            futures::stream::select(control.accept(CONTACT)?, relay_control.accept(CONTACT)?);
-        let mut chats = futures::stream::select(control.accept(CHAT)?, relay_control.accept(CHAT)?);
+        let mut files = futures::stream::select(
+            legacy_files.map(|(p, s, r)| (p, s, r, false)),
+            overlay_control
+                .accept(FILE)?
+                .map(|(p, s)| (p, s, false, true)),
+        );
+        let mut contacts = futures::stream::select(
+            futures::stream::select(
+                control.accept(CONTACT)?.map(|(p, s)| (p, s, false)),
+                relay_control.accept(CONTACT)?.map(|(p, s)| (p, s, false)),
+            ),
+            overlay_control.accept(CONTACT)?.map(|(p, s)| (p, s, true)),
+        );
+        let mut chats = futures::stream::select(
+            futures::stream::select(
+                control.accept(CHAT)?.map(|(p, s)| (p, s, false)),
+                relay_control.accept(CHAT)?.map(|(p, s)| (p, s, false)),
+            ),
+            overlay_control.accept(CHAT)?.map(|(p, s)| (p, s, true)),
+        );
+        let mut overlay_contacts = futures::stream::select(
+            futures::stream::select(
+                control
+                    .accept(overlay_network::overlay_protocol())?
+                    .map(|(p, s)| (p, s, false)),
+                relay_control
+                    .accept(overlay_network::overlay_protocol())?
+                    .map(|(p, s)| (p, s, false)),
+            ),
+            overlay_control
+                .accept(overlay_network::overlay_protocol())?
+                .map(|(p, s)| (p, s, true)),
+        );
         let (dial, mut dials) = mpsc::channel(128);
         let (protocol_reports, mut reports) = mpsc::channel::<ProtocolReport>(128);
         let tasks = TaskTracker::new();
@@ -574,6 +676,7 @@ impl Node {
         #[cfg(test)]
         let (nat_confirmations_tx, nat_confirmations) = watch::channel(0);
         let (relay_tx, relay_addresses) = watch::channel(Vec::new());
+        let (overlay_tx, overlay_peers) = watch::channel(BTreeSet::new());
         let limits = Arc::new(Limits::new());
         let shutdown = CancellationToken::new();
         let (host_error, mut host_errors) = mpsc::channel(1);
@@ -593,6 +696,11 @@ impl Node {
             shared: shared.clone(),
             control: control.clone(),
             relay_control,
+            overlay_control,
+            overlay_scope,
+            tailscale_refresh: Arc::new(Mutex::new(())),
+            #[cfg(test)]
+            overlay_test: config.overlay.map(Arc::new),
             lan_control,
             dial,
             protocol_reports,
@@ -601,6 +709,7 @@ impl Node {
             diagnostics,
             reachability,
             relay_addresses,
+            overlay_peers,
             limits: limits.clone(),
             shutdown: shutdown.clone(),
             #[cfg(test)]
@@ -621,10 +730,13 @@ impl Node {
             let mut last_join = 0;
             let mut tick = tokio::time::interval(Duration::from_secs(2));
             let mut listeners = Vec::new();
+            let mut live_listeners=crate::listener_state::LiveListeners::default();
             let mut public = PublicAddresses::default();
             let mut reservations = BTreeMap::new();
             let mut connections = BTreeMap::new();
             let mut lan_connections = BTreeMap::new();
+            let mut overlay_connections = OverlayConnections::new();
+            let mut overlay_listeners = OverlayListeners::default();
             let mut attempts: BTreeMap<PeerId, (Instant, usize)> = BTreeMap::new();
             loop {
                 tokio::select! {
@@ -648,6 +760,9 @@ impl Node {
                             let result = if allow_loopback {
                                 if present {
                                     lan_discovered.remember(dial.peer, &dial.address, true);
+                                    if discovered.remember(dial.peer,dial.address.clone()).is_ok_and(|added|added) {
+                                        swarm.add_peer_address(dial.peer,dial.address.clone());
+                                    }
                                 } else {
                                     lan_discovered.expire(dial.peer, &dial.address, true);
                                 }
@@ -670,7 +785,12 @@ impl Node {
                                 }
                             } else if connection_state(&connections, peer) == ConnectionState::Offline || (!is_relayed(&address) && connection_state(&connections, peer) == ConnectionState::Relay) {
                                 let condition = if connection_state(&connections, peer) == ConnectionState::Relay { PeerCondition::Always } else { PeerCondition::DisconnectedAndNotDialing };
-                                swarm.dial(DialOpts::peer_id(peer).condition(condition).addresses(vec![address.with(libp2p::multiaddr::Protocol::P2p(peer))]).build())?;
+                                match swarm.dial(DialOpts::peer_id(peer).condition(condition).addresses(vec![address.with(libp2p::multiaddr::Protocol::P2p(peer))]).build()) {
+                                    // The route was recorded above. Another attempt may already
+                                    // be dialing; this API acknowledges registration, not success.
+                                    Ok(()) | Err(DialError::DialPeerConditionFalse(_)) => {}
+                                    Err(error) => return Err(error.into()),
+                                }
                                 diagnostic_tx.send_modify(|d| {
                                     if let Some(d) = diagnostic(d, peer) {
                                         if !swarm.is_connected(&peer) { d.state = ConnectionState::Connecting; }
@@ -699,42 +819,49 @@ impl Node {
                             }
                         }
                     },
-                    Some((peer, stream)) = incoming.next() => {
+                    Some((peer, stream, overlay)) = incoming.next() => {
                         if let Ok(permit) = incoming_slots.clone().try_acquire_owned() {
                             let state = shared.clone();
-                            actor_tasks.spawn(async move { let _permit = permit; let _ = serve_control(state, peer, stream).await; });
+                            actor_tasks.spawn(async move { let _permit = permit; let _ = serve_control_transport(state, peer, stream, overlay).await; });
                         }
                     },
-                    Some((peer, stream, relayed)) = files.next() => {
+                    Some((peer, stream, relayed, overlay)) = files.next() => {
                         if let Ok(permit) = incoming_file_slots.clone().try_acquire_owned() {
                             let state = shared.clone(); let limits = limits.clone();
-                            actor_tasks.spawn(async move { let _permit = permit; let _ = serve_file(state, limits, peer, stream, relayed).await; });
+                            actor_tasks.spawn(async move { let _permit = permit; let _ = serve_file_transport(state, limits, peer, stream, relayed, overlay).await; });
                         }
                     },
-                    Some((peer, stream)) = contacts.next() => {
+                    Some((peer, stream, overlay)) = contacts.next() => {
                         if let Ok(permit) = incoming_slots.clone().try_acquire_owned() {
                             let state = shared.clone();
-                            actor_tasks.spawn(async move { let _permit = permit; let _ = serve_contacts(state, peer, stream).await; });
+                            actor_tasks.spawn(async move { let _permit = permit; let _ = serve_contacts_transport(state, peer, stream, overlay).await; });
                         }
                     },
-                    Some((peer, stream)) = chats.next() => {
+                    Some((peer, stream, overlay)) = chats.next() => {
                         if let Ok(permit) = incoming_slots.clone().try_acquire_owned() {
                             let state = shared.clone();
-                            actor_tasks.spawn(async move { let _permit = permit; let _ = serve_chat(state, peer, stream).await; });
+                            actor_tasks.spawn(async move { let _permit = permit; let _ = serve_chat_transport(state, peer, stream, overlay).await; });
+                        }
+                    },
+                    Some((peer, stream, overlay)) = overlay_contacts.next() => {
+                        if let Ok(permit)=incoming_slots.clone().try_acquire_owned() {
+                            let state=shared.clone();
+                            actor_tasks.spawn(async move {let _permit=permit;let _=overlay_network::serve_overlay_contacts(state,peer,stream,overlay).await;});
                         }
                     },
                     event = swarm.select_next_some() => match event {
-                        SwarmEvent::NewListenAddr { address, .. } => {
+                        SwarmEvent::NewListenAddr { listener_id,address, .. } => {
                             if is_relayed(&address) {
                                 relay_tx.send_modify(|a| { if a.len() < 3 && !a.contains(&address) { a.push(address.clone()); } });
                             } else if public_address(&address) {
                                 swarm.behaviour_mut().autonat.on_swarm_event(FromSwarm::NewExternalAddrCandidate(NewExternalAddrCandidate { addr: &address }));
                             }
-                            listeners.push(address); let _ = address_tx.send(listeners.clone());
+                            live_listeners.add(listener_id,address);listeners=live_listeners.addresses();let _ = address_tx.send(listeners.clone());
                             let mut e = shared.lock().await; e.network_status = if discovery { "LAN discovery is running" } else { "Listening for direct connections" }.into(); e.emit();
                         },
-                        SwarmEvent::ExpiredListenAddr { address, .. } => {
-                            listeners.retain(|a| a != &address); let _ = address_tx.send(listeners.clone());
+                        SwarmEvent::ExpiredListenAddr { listener_id,address, .. } => {
+                            live_listeners.expire(listener_id,&address);listeners=live_listeners.addresses();let _ = address_tx.send(listeners.clone());
+                            if listeners.contains(&address) {continue;}
                             relay_tx.send_modify(|a| a.retain(|a| a != &address));
                             if public.remove(&address) {
                                 swarm.remove_external_address(&address);
@@ -749,11 +876,12 @@ impl Node {
                             }
                         },
                         SwarmEvent::ListenerClosed { listener_id, addresses, .. } => {
+                            poll_node.overlay_listener_error(&mut overlay_listeners,listener_id);
                             reservations.retain(|_, id| *id != listener_id);
-                            listeners.retain(|a| !addresses.contains(a)); let _ = address_tx.send(listeners.clone());
-                            relay_tx.send_modify(|a| a.retain(|a| !addresses.contains(a)));
+                            live_listeners.close(listener_id);listeners=live_listeners.addresses();let _ = address_tx.send(listeners.clone());
+                            relay_tx.send_modify(|a| a.retain(|a| !addresses.contains(a) || listeners.contains(a)));
                             let mut withdrawn = false;
-                            for address in &addresses { if public.remove(address) { swarm.remove_external_address(address); withdrawn = true; } }
+                            for address in &addresses { if !listeners.contains(address) && public.remove(address) { swarm.remove_external_address(address); withdrawn = true; } }
                             if withdrawn {
                                 let addresses = public.addresses();
                                 reachability_tx.send_replace(Reachability { status: if addresses.is_empty() { ReachabilityStatus::Unknown } else { ReachabilityStatus::Public }, public_addresses: addresses });
@@ -813,6 +941,10 @@ impl Node {
                         },
                         SwarmEvent::ConnectionEstablished { peer_id, connection_id, endpoint, .. } => {
                             connections.insert(connection_id, (peer_id, endpoint.is_relayed()));
+                            if overlay_network::endpoint(&poll_node.overlay_scope,&endpoint) {
+                                overlay_connections.insert(connection_id,(peer_id,endpoint.clone()));
+                                overlay_tx.send_replace(overlay_connections.values().map(|(peer,_)|*peer).collect());
+                            }
                             if lan_endpoint(peer_id, &endpoint, allow_loopback) {
                                 lan_connections.insert(connection_id, peer_id);
                             }
@@ -824,15 +956,25 @@ impl Node {
                             });
                         },
                         SwarmEvent::OutgoingConnectionError { peer_id: Some(peer_id), error, .. } => {
+                            let wrong_peer=matches!(&error,DialError::WrongPeerId {..});
                             diagnostic_tx.send_modify(|d| {
                                 if let Some(d) = diagnostic(d, peer_id) {
                                     if !swarm.is_connected(&peer_id) { d.state = ConnectionState::Offline; }
                                     d.last_failure = Some(if matches!(error, DialError::WrongPeerId { .. }) { DialFailure::WrongPeer } else { DialFailure::Unreachable });
                                 }
                             });
+                            if wrong_peer {
+                                let mut e=shared.lock().await;
+                                if e.overlay_policy()==crate::overlay::WorkspaceNetworkPolicy::TailscaleOnly {
+                                    let message="The Tailscale endpoint belongs to a different Dump device. Ask for a fresh link and verify the device fingerprint.";
+                                    if e.last_error.as_deref()!=Some(message) {e.error(message);}
+                                }
+                            }
                         },
                         SwarmEvent::ConnectionClosed { peer_id, connection_id, num_established, .. } => {
                             connections.remove(&connection_id);
+                            overlay_connections.remove(&connection_id);
+                            overlay_tx.send_replace(overlay_connections.values().map(|(peer,_)|*peer).collect());
                             lan_connections.remove(&connection_id);
                             if num_established != 0 {
                                 diagnostic_tx.send_modify(|d| { if let Some(d) = diagnostic(d, peer_id) { d.state = connection_state(&connections, peer_id); } });
@@ -863,6 +1005,7 @@ impl Node {
                             e.emit();
                         },
                         SwarmEvent::ListenerError { listener_id, .. } => {
+                            if poll_node.overlay_listener_error(&mut overlay_listeners,listener_id) { continue; }
                             let configured_relay = reservations.values().any(|id| *id == listener_id);
                             if configured_relay { swarm.remove_listener(listener_id); reservations.retain(|_, id| *id != listener_id); }
                             let message = if configured_relay { "Configured relay is unavailable or has no capacity; direct and LAN routes can still work" } else { "Local listener failed; restart Dump and check Windows firewall" };
@@ -878,6 +1021,9 @@ impl Node {
                             reachability_tx.send_replace(Reachability { status: if addresses.is_empty() { ReachabilityStatus::Unknown } else { ReachabilityStatus::Public }, public_addresses: addresses });
                         }
                         let mut e = shared.lock().await;
+                        poll_node.sync_overlay(&mut e,&mut swarm,&listeners,&mut overlay_listeners,&mut overlay_connections,&connections);
+                        overlay_tx.send_replace(overlay_connections.values().map(|(peer,_)|*peer).collect());
+                        let strict=e.overlay_policy()==crate::overlay::WorkspaceNetworkPolicy::TailscaleOnly;
                         e.expire_lan_invites();
                         let mut lan_joining = e.lan_joining.as_ref().map(|join| (join.code.clone(), join.expires_at, join.owner_peer_id.clone()));
                         if let Some((code, expires_at, _)) = &lan_joining {
@@ -909,18 +1055,23 @@ impl Node {
                         e.remote.retain(|_,m| active_peers.contains(&m.owner_peer_id));
                         e.pending.retain(|_,p| now().saturating_sub(p.requested_at) < 86400);
                         let joining = e.persisted.joining.clone();
-                        let targets = e.active_snapshot().ok().filter(|s| s.contains(&e.peer())).map(|s| s.members.into_iter().filter_map(|m| m.peer_id.parse::<PeerId>().ok()).filter(|p| *p != peer).collect::<Vec<_>>()).unwrap_or_default();
+                        let join_context=JoinAttemptContext {epoch:e.network_epoch,overlay:e.persisted.overlay_joining.clone()};
+                        let targets = if joining.is_some() || lan_joining.is_some() {Vec::new()} else {e.active_snapshot().ok().filter(|s| s.contains(&e.peer())).map(|s| s.members.into_iter().filter_map(|m| m.peer_id.parse::<PeerId>().ok()).filter(|p| *p != peer).collect::<Vec<_>>()).unwrap_or_default()};
                         let mut desired = targets.clone();
                         if let Some(invite) = &joining { if let Ok(id) = invite.owner_peer_id.parse() { desired.push(id); } }
                         desired.sort(); desired.dedup();
+                        let mut overlay_route_available=desired.is_empty();
                         attempts.retain(|p, _| desired.contains(p));
                         for target in &desired {
-                            let mut routes = discovered.routes(target);
+                            let mut routes = if strict {poll_node.overlay_routes(&e,*target)} else {discovered.routes(target)};
+                            if !strict {
                             if let Some(contact) = e.persisted.contacts.get(&target.to_string()) { if let Ok(contact_routes) = contact.routes_with_policy(allow_loopback) { routes.extend(contact_routes); } }
                             if let Some(contact) = joining.as_ref().and_then(|i| i.contact.as_ref()).filter(|c| c.peer_id == target.to_string()) { if let Ok(contact_routes) = contact.routes_with_policy(allow_loopback) { routes.extend(contact_routes); } }
+                            }
                             let routes = preferred_routes(*target, routes);
+                            if strict && !routes.is_empty() {overlay_route_available=true;}
                             if routes.is_empty() { continue; }
-                            let state = connection_state(&connections, *target);
+                            let state = overlay_network::route_state(&connections,&overlay_connections,*target,strict);
                             let available: Vec<_> = routes.into_iter().filter(|a| state != ConnectionState::Relay || !is_relayed(a)).collect();
                             if state == ConnectionState::Direct || available.is_empty() { continue; }
                             if let Some((at, _)) = attempts.get(target) { if at.elapsed() < Duration::from_secs(if state == ConnectionState::Relay { 30 } else { 10 }) { continue; } }
@@ -928,14 +1079,19 @@ impl Node {
                             let address = available[index].clone();
                             {
                                 let condition = if state == ConnectionState::Relay { PeerCondition::Always } else { PeerCondition::DisconnectedAndNotDialing };
-                                let _ = swarm.dial(DialOpts::peer_id(*target).condition(condition).addresses(vec![address.with(libp2p::multiaddr::Protocol::P2p(*target))]).build());
+                                let condition=if swarm.is_connected(target) {PeerCondition::Always} else {condition};
+                                let options = DialOpts::peer_id(*target).condition(condition).addresses(vec![address.with(libp2p::multiaddr::Protocol::P2p(*target))]);
+                                // Tailscale handles NAT itself. An outbound QUIC connection must
+                                // not retain our fixed listener socket while draining on logout.
+                                let options = if strict { options.allocate_new_port() } else { options };
+                                let _ = swarm.dial(options.build());
                                 diagnostic_tx.send_modify(|d| { if let Some(d) = diagnostic(d, *target) { if state == ConnectionState::Offline { d.state = ConnectionState::Connecting; } } });
                             }
                             attempts.insert(*target, (Instant::now(), index + 1));
                         }
-                        e.network_status = if !e.online.is_empty() { if e.online.keys().filter_map(|p| p.parse::<PeerId>().ok()).any(|p| connection_state(&connections, p) == ConnectionState::Direct) { "Connected directly" } else { "Connected via relay" } } else if joining.is_some() || lan_joining.is_some() || desired.iter().any(|p| diagnostic_tx.borrow().get(p).is_some_and(|d| d.state == ConnectionState::Connecting)) { "Connecting…" } else if listeners.is_empty() || !desired.is_empty() { "Offline" } else if discovery { "LAN discovery is running" } else { "Offline" }.into();
+                        e.network_status = if strict {if !e.persisted.network.use_tailscale || e.tailscale.state!=crate::tailscale::TailscaleState::Ready {"Tailscale is not ready"} else if !e.overlay_listener_ready {"Opening Tailscale listener…"} else if !overlay_connections.is_empty() {"Via Tailscale"} else if desired.is_empty() {"Tailscale is ready"} else if !overlay_route_available {"Tailscale peer is not visible or is offline; check sharing and use a fresh link"} else {"Connecting via Tailscale…"}} else if !e.online.is_empty() { if e.online.keys().filter_map(|p| p.parse::<PeerId>().ok()).any(|p| overlay_network::route_state(&connections,&overlay_connections,p,false) == ConnectionState::Direct) { "Connected directly" } else { "Connected via relay" } } else if joining.is_some() || lan_joining.is_some() || desired.iter().any(|p| diagnostic_tx.borrow().get(p).is_some_and(|d| d.state == ConnectionState::Connecting)) { "Connecting…" } else if listeners.is_empty() || !desired.is_empty() { "Offline" } else if discovery { "LAN discovery is running" } else { "Offline" }.into();
                         e.emit(); drop(e);
-                        for target in targets.into_iter().filter(|p| connection_state(&connections, *p) != ConnectionState::Offline) {
+                        for target in targets.into_iter().filter(|p| overlay_network::route_state(&connections,&overlay_connections,*p,strict) != ConnectionState::Offline) {
                             let mut ongoing = in_flight.lock().await;
                             if ongoing.insert(target) {
                                 let node = poll_node.clone(); let ongoing = in_flight.clone();
@@ -946,9 +1102,9 @@ impl Node {
                             if now() >= last_join + 4 {
                                 last_join = now();
                                 if let Ok(target) = invite.owner_peer_id.parse::<PeerId>() {
-                                    if connection_state(&connections, target) != ConnectionState::Offline {
+                                    if overlay_network::route_state(&connections,&overlay_connections,target,strict) != ConnectionState::Offline {
                                         let mut ongoing = in_flight.lock().await;
-                                        if ongoing.insert(target) { let node = poll_node.clone(); let ongoing = in_flight.clone(); actor_tasks.spawn(async move { let _ = node.poll_join(invite).await; ongoing.lock().await.remove(&target); }); }
+                                        if ongoing.insert(target) { let node = poll_node.clone(); let ongoing = in_flight.clone(); actor_tasks.spawn(async move { let _ = node.poll_join_with_context(invite,join_context).await; ongoing.lock().await.remove(&target); }); }
                                     }
                                 }
                             }
@@ -1009,6 +1165,19 @@ impl Node {
                         }
                     }
                     rotation = (rotation + 1) % configured.len();
+                }
+            });
+        }
+        if discovery {
+            let inspected = node.clone();
+            tasks.spawn(async move {
+                let mut delay=15;
+                loop {
+                    if inspected.shared.lock().await.persisted.network.use_tailscale {
+                        let _=inspected.refresh_tailscale().await;
+                        delay=if inspected.shared.lock().await.tailscale.state==crate::tailscale::TailscaleState::Ready {15} else {(delay*2).min(60)};
+                    }
+                    tokio::select! {_=inspected.shutdown.cancelled()=>break,_=tokio::time::sleep(Duration::from_secs(delay))=>{}}
                 }
             });
         }
@@ -1107,8 +1276,113 @@ impl Node {
         }
     }
     pub async fn request(&self, peer: PeerId, request: &Request) -> Result<Response> {
-        let mut stream = self.open_stream(peer, CONTROL).await?;
+        if let Request::Join { invitation, name } = request {
+            let context = {
+                let e = self.shared.lock().await;
+                JoinAttemptContext {
+                    epoch: e.network_epoch,
+                    overlay: e.persisted.overlay_joining.clone(),
+                }
+            };
+            return self.request_join(peer, invitation, name, &context).await;
+        }
+        let (strict, workspace) = {
+            let e = self.shared.lock().await;
+            match request {
+                Request::Join { .. } => {
+                    bail!("Join requests require their captured routing context")
+                }
+                Request::Catalog { snapshot, .. } | Request::File { snapshot, .. } => (
+                    e.persisted
+                        .workspace_network
+                        .get(&snapshot.workspace_id)
+                        .is_some_and(|p| {
+                            *p == crate::overlay::WorkspaceNetworkPolicy::TailscaleOnly
+                        }),
+                    e.persisted.active.filter(|id| *id == snapshot.workspace_id),
+                ),
+            }
+        };
+        let relayed = !strict
+            && self
+                .diagnostics
+                .borrow()
+                .get(&peer)
+                .is_some_and(|d| d.state == ConnectionState::Relay);
+        let mut stream = self
+            .open_stream_for_policy(peer, CONTROL, relayed, strict, workspace)
+            .await?;
         write_frame(&mut stream, request).await?;
+        read_frame(&mut stream).await
+    }
+
+    fn check_join_context(
+        e: &crate::engine::Engine,
+        invitation: &Invitation,
+        context: &JoinAttemptContext,
+    ) -> Result<()> {
+        let current = e
+            .persisted
+            .joining
+            .as_ref()
+            .context("Join was cancelled or replaced")?;
+        ensure!(
+            e.network_epoch == context.epoch
+                && current.token == invitation.token
+                && current.workspace_id == invitation.workspace_id
+                && current.owner_peer_id == invitation.owner_peer_id
+                && current.version == invitation.version
+                && e.persisted.overlay_joining == context.overlay,
+            "Join was cancelled or replaced"
+        );
+        if let Some(contact) = &context.overlay {
+            contact.verify()?;
+            ensure!(
+                contact.workspace_id == invitation.workspace_id
+                    && contact.peer_id == invitation.owner_peer_id,
+                "Overlay join context changed"
+            );
+        }
+        Ok(())
+    }
+
+    async fn request_join(
+        &self,
+        peer: PeerId,
+        invitation: &Invitation,
+        name: &str,
+        context: &JoinAttemptContext,
+    ) -> Result<Response> {
+        ensure!(
+            invitation.owner_peer_id == peer.to_string(),
+            "Join target does not match its owner"
+        );
+        {
+            let e = self.shared.lock().await;
+            Self::check_join_context(&e, invitation, context)?;
+        }
+        let strict = context.overlay.is_some();
+        let relayed = !strict
+            && self
+                .diagnostics
+                .borrow()
+                .get(&peer)
+                .is_some_and(|d| d.state == ConnectionState::Relay);
+        let mut stream = self
+            .open_stream_for_policy(peer, CONTROL, relayed, strict, None)
+            .await?;
+        {
+            let e = self.shared.lock().await;
+            Self::check_join_context(&e, invitation, context)?;
+        }
+        write_frame(
+            &mut stream,
+            &Request::Join {
+                invitation: invitation.clone(),
+                name: name.into(),
+            },
+        )
+        .await?;
         read_frame(&mut stream).await
     }
 
@@ -1124,6 +1398,10 @@ impl Node {
             .context("Wait for the current chat message to finish sending")?;
         let (message, targets) = {
             let mut e = self.shared.lock().await;
+            ensure!(
+                e.persisted.joining.is_none() && e.lan_joining.is_none(),
+                "Finish or cancel joining a workspace before sending chat"
+            );
             let snapshot = e.active_snapshot()?;
             ensure!(
                 snapshot.workspace_id == workspace,
@@ -1223,7 +1501,37 @@ impl Node {
         protocol: StreamProtocol,
         relayed: bool,
     ) -> Result<Stream> {
-        let mut control = if relayed {
+        let (strict, workspace) = {
+            let e = self.shared.lock().await;
+            (overlay_network::active_overlay(&e), e.persisted.active)
+        };
+        self.open_stream_for_policy(peer, protocol, relayed, strict, workspace)
+            .await
+    }
+    async fn open_stream_for_policy(
+        &self,
+        peer: PeerId,
+        protocol: StreamProtocol,
+        relayed: bool,
+        strict: bool,
+        workspace: Option<Uuid>,
+    ) -> Result<Stream> {
+        if strict {
+            let e = self.shared.lock().await;
+            ensure!(
+                e.persisted.network.use_tailscale
+                    && e.overlay_listener_ready
+                    && e.tailscale.state == crate::tailscale::TailscaleState::Ready,
+                "Tailscale is not ready"
+            );
+            ensure!(
+                self.overlay_peers.borrow().contains(&peer),
+                "Tailscale peer is not connected. Check sharing, permissions and port 42043."
+            );
+        }
+        let mut control = if strict {
+            self.overlay_control.clone()
+        } else if relayed {
             self.relay_control.clone()
         } else {
             self.control.clone()
@@ -1247,7 +1555,16 @@ impl Node {
             #[cfg(test)]
             probe: None,
         });
-        Ok(result??)
+        let stream = result??;
+        if let Some(workspace) = workspace {
+            let e = self.shared.lock().await;
+            ensure!(
+                e.persisted.active == Some(workspace)
+                    && overlay_network::active_overlay(&e) == strict,
+                "Workspace or network policy changed; retry the operation"
+            );
+        }
+        Ok(stream)
     }
     pub async fn shutdown_and_wait(&self) {
         self.shutdown.cancel();
@@ -1284,22 +1601,32 @@ impl Node {
         }
         Ok(())
     }
+    #[cfg(test)]
     async fn poll_join(&self, invitation: Invitation) -> Result<()> {
+        let context = {
+            let e = self.shared.lock().await;
+            JoinAttemptContext {
+                epoch: e.network_epoch,
+                overlay: e.persisted.overlay_joining.clone(),
+            }
+        };
+        self.poll_join_with_context(invitation, context).await
+    }
+    async fn poll_join_with_context(
+        &self,
+        invitation: Invitation,
+        context: JoinAttemptContext,
+    ) -> Result<()> {
         let peer = invitation.owner_peer_id.parse()?;
         let name = self.shared.lock().await.persisted.device_name.clone();
         match self
-            .request(
-                peer,
-                &Request::Join {
-                    invitation: invitation.clone(),
-                    name,
-                },
-            )
+            .request_join(peer, &invitation, &name, &context)
             .await?
         {
             Response::Approved { workspace } => {
                 workspace.snapshot.verify()?;
                 let mut e = self.shared.lock().await;
+                Self::check_join_context(&e, &invitation, &context)?;
                 ensure!(
                     workspace.snapshot.workspace_id == invitation.workspace_id
                         && workspace.snapshot.owner_peer_id == invitation.owner_peer_id
@@ -1315,6 +1642,18 @@ impl Node {
                 );
                 let mut next = e.persisted.clone();
                 next.active = Some(invitation.workspace_id);
+                if let Some(contact) = next.overlay_joining.take() {
+                    ensure!(
+                        contact.workspace_id == invitation.workspace_id
+                            && contact.peer_id == invitation.owner_peer_id,
+                        "Overlay approval context changed"
+                    );
+                    next.workspace_network.insert(
+                        invitation.workspace_id,
+                        crate::overlay::WorkspaceNetworkPolicy::TailscaleOnly,
+                    );
+                    next.overlay_contacts.insert(contact.cache_key(), contact);
+                }
                 next.joining = None;
                 if let Some(old) = next.workspaces.get(&invitation.workspace_id) {
                     ensure!(
@@ -1340,22 +1679,14 @@ impl Node {
             }
             Response::Denied => {
                 let mut e = self.shared.lock().await;
-                if e.persisted
-                    .joining
-                    .as_ref()
-                    .is_some_and(|i| i.token == invitation.token)
-                {
+                if Self::check_join_context(&e, &invitation, &context).is_ok() {
                     e.cancel_join()?;
                     e.error("Invitation was rejected, expired, or already used. Ask the owner for a new invite.");
                 }
             }
             Response::Waiting => {
                 let mut e = self.shared.lock().await;
-                if e.persisted.joining.as_ref().is_some_and(|current| {
-                    current.token == invitation.token
-                        && current.workspace_id == invitation.workspace_id
-                        && current.owner_peer_id == invitation.owner_peer_id
-                }) {
+                if Self::check_join_context(&e, &invitation, &context).is_ok() {
                     e.join_request_submitted = true;
                     e.emit();
                 }
@@ -1448,11 +1779,14 @@ impl Node {
         e.online.insert(peer.to_string(), now());
         e.emit();
         drop(e);
-        if self
-            .diagnostics
-            .borrow()
-            .get(&peer)
-            .is_some_and(|d| d.supports_contacts)
+        let _ = self.exchange_overlay_contacts(peer).await;
+        if self.shared.lock().await.overlay_policy()
+            != crate::overlay::WorkspaceNetworkPolicy::TailscaleOnly
+            && self
+                .diagnostics
+                .borrow()
+                .get(&peer)
+                .is_some_and(|d| d.supports_contacts)
         {
             self.exchange_contacts(peer).await?;
         }
@@ -1515,6 +1849,10 @@ impl Node {
         ensure!(directory.is_dir(), "Choose an existing destination folder");
         let (manifest, id, cancel) = {
             let mut e = self.shared.lock().await;
+            ensure!(
+                e.persisted.joining.is_none() && e.lan_joining.is_none(),
+                "Finish or cancel joining a workspace before receiving files"
+            );
             ensure!(e.cancellations.len() < 100, "Transfer queue is full");
             let manifest = e
                 .remote
@@ -1529,8 +1867,10 @@ impl Node {
                 .get(&manifest.owner_peer_id.parse::<PeerId>()?)
                 .is_some_and(|d| d.state == ConnectionState::Relay);
             let (id, cancel) = e.register_transfer(&manifest, &manifest.owner_peer_id, "Receiving");
+            let overlay = overlay_network::active_overlay(&e);
             if let Some(transfer) = e.transfers.get_mut(&id) {
-                transfer.relayed = relayed;
+                transfer.relayed = relayed && !overlay;
+                transfer.tailscale = overlay;
             }
             (manifest, id, cancel)
         };
@@ -1622,8 +1962,11 @@ impl Node {
             .borrow()
             .get(&peer)
             .is_some_and(|d| d.state == ConnectionState::Relay);
+        let overlay = overlay_network::active_overlay(&*self.shared.lock().await);
+        let relayed = relayed && !overlay;
         if let Some(t) = self.shared.lock().await.transfers.get_mut(&id) {
             t.relayed = relayed;
+            t.tailscale = overlay;
         }
         let mut stream = tokio::select! {
             _ = cancel.cancelled() => bail!("Transfer cancelled"),
@@ -1847,6 +2190,7 @@ async fn handle_lan_invite(
 ) -> Result<LanInviteResponse> {
     ensure!(request.code.len() == 16, "Invalid LAN invitation");
     let mut e = shared.lock().await;
+    e.check_transport(false)?;
     e.expire_lan_invites();
     let invite = e.lan_invites.get(&request.code).context("Access denied")?;
     let invitation = invite.invitation.clone();
@@ -1885,10 +2229,18 @@ async fn handle_lan_invite(
     })
 }
 
-pub async fn serve_control(shared: Shared, peer: PeerId, mut stream: Stream) -> Result<()> {
+pub async fn serve_control(shared: Shared, peer: PeerId, stream: Stream) -> Result<()> {
+    serve_control_transport(shared, peer, stream, false).await
+}
+async fn serve_control_transport(
+    shared: Shared,
+    peer: PeerId,
+    mut stream: Stream,
+    overlay: bool,
+) -> Result<()> {
     shared.lock().await.admit_request(&peer.to_string())?;
     let request = read_frame::<_, Request>(&mut stream).await?;
-    let response = handle_control(shared, peer, request)
+    let response = handle_control_transport(shared, peer, request, overlay)
         .await
         .unwrap_or(Response::Denied);
     write_frame(&mut stream, &response).await?;
@@ -1896,12 +2248,18 @@ pub async fn serve_control(shared: Shared, peer: PeerId, mut stream: Stream) -> 
     Ok(())
 }
 
-async fn serve_chat(shared: Shared, peer: PeerId, mut stream: Stream) -> Result<()> {
+async fn serve_chat_transport(
+    shared: Shared,
+    peer: PeerId,
+    mut stream: Stream,
+    overlay: bool,
+) -> Result<()> {
     shared.lock().await.admit_request(&peer.to_string())?;
     let request: ChatRequest = read_frame(&mut stream).await?;
     let id = request.message.id;
     let response = {
         let mut e = shared.lock().await;
+        e.check_transport(overlay)?;
         match e.receive_chat(&peer.to_string(), &request.snapshot, request.message) {
             Ok(()) => ChatResponse::Stored { message_id: id },
             Err(_) => ChatResponse::Denied,
@@ -1912,11 +2270,17 @@ async fn serve_chat(shared: Shared, peer: PeerId, mut stream: Stream) -> Result<
     stream.close().await?;
     Ok(())
 }
-async fn serve_contacts(shared: Shared, peer: PeerId, mut stream: Stream) -> Result<()> {
+async fn serve_contacts_transport(
+    shared: Shared,
+    peer: PeerId,
+    mut stream: Stream,
+    overlay: bool,
+) -> Result<()> {
     shared.lock().await.admit_request(&peer.to_string())?;
     let request: ContactRequest = read_frame(&mut stream).await?;
     let response = {
         let mut e = shared.lock().await;
+        e.check_transport(overlay)?;
         let snapshot = e.authorize(&peer.to_string(), &request.snapshot)?;
         ensure!(
             request.offset <= MAX_MEMBERS as u32,
@@ -2001,7 +2365,16 @@ fn handle_join(
 }
 
 pub async fn handle_control(shared: Shared, peer: PeerId, request: Request) -> Result<Response> {
+    handle_control_transport(shared, peer, request, false).await
+}
+async fn handle_control_transport(
+    shared: Shared,
+    peer: PeerId,
+    request: Request,
+    overlay: bool,
+) -> Result<Response> {
     let mut e = shared.lock().await;
+    e.check_transport(overlay)?;
     match request {
         Request::Join { invitation, name } => {
             validate_label(&name)?;
@@ -2054,18 +2427,20 @@ pub async fn handle_control(shared: Shared, peer: PeerId, request: Request) -> R
     }
 }
 
-async fn serve_file(
+async fn serve_file_transport(
     shared: Shared,
     limits: Arc<Limits>,
     peer: PeerId,
     mut stream: Stream,
     relayed: bool,
+    overlay: bool,
 ) -> Result<()> {
     shared.lock().await.admit_request(&peer.to_string())?;
     let request: Request = read_frame(&mut stream).await?;
     let (manifest, share, id, cancel) = {
         let mut e = shared.lock().await;
         let result: Result<_> = (|| {
+            e.check_transport(overlay)?;
             let Request::File { snapshot, manifest } = request else {
                 bail!("Wrong protocol")
             };
@@ -2094,6 +2469,7 @@ async fn serve_file(
                 let (id, cancel) = e.register_transfer(&manifest, &peer.to_string(), "Sharing");
                 if let Some(t) = e.transfers.get_mut(&id) {
                     t.relayed = relayed;
+                    t.tailscale = overlay;
                 }
                 (manifest, share, id, cancel)
             }
@@ -2192,6 +2568,36 @@ mod internet_tests {
         engine::{share_paths, Engine},
     };
     use libp2p::swarm::Swarm;
+    #[tokio::test]
+    async fn repeated_connect_acknowledges_route_while_quic_dial_is_pending() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let shared = Engine::open(root.path(), Arc::new(|_| {}))?;
+        let node = Node::start_inner(shared, false, true).await?;
+        // Keep the socket bound but never answer QUIC, so the first dial stays
+        // pending. Registering a route is idempotent and is not a handshake ACK.
+        let blackhole = std::net::UdpSocket::bind("127.0.0.1:0")?;
+        let address: Multiaddr = format!(
+            "/ip4/127.0.0.1/udp/{}/quic-v1",
+            blackhole.local_addr()?.port()
+        )
+        .parse()?;
+        let peer = libp2p::identity::Keypair::generate_ed25519()
+            .public()
+            .to_peer_id();
+        let result = async {
+            node.connect(peer, address.clone()).await?;
+            node.connect(peer, address).await?;
+            assert!(!node
+                .diagnostics
+                .borrow()
+                .get(&peer)
+                .is_some_and(|d| d.state == ConnectionState::Direct));
+            Ok(())
+        }
+        .await;
+        node.shutdown_and_wait().await;
+        result
+    }
     async fn wait(shared: &Shared, predicate: impl Fn(&crate::engine::View) -> bool) -> Result<()> {
         wait_stage("state transition", shared, None, predicate).await
     }

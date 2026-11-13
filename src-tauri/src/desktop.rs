@@ -85,6 +85,7 @@ mod tests {
                 peer_id: "peer".into(),
                 direction: "Receiving".into(),
                 relayed: false,
+                tailscale: false,
                 bytes: 0,
                 total: 1,
                 status: "Queued".into(),
@@ -145,6 +146,10 @@ async fn save_network(
     settings: crate::relay_host::Settings,
 ) -> Result<(), String> {
     let mut e = state.shared.lock().await;
+    if settings.use_tailscale != e.persisted.network.use_tailscale {
+        e.ensure_network_idle().map_err(|err| err.to_string())?;
+        e.tailscale_generation = e.tailscale_generation.wrapping_add(1);
+    }
     settings
         .validate(
             e.persisted
@@ -159,7 +164,24 @@ async fn save_network(
     next.relay_identity_migrated = false;
     e.persist(next).map_err(|err| err.to_string())?;
     e.emit();
+    let inspect = e.persisted.network.use_tailscale;
+    drop(e);
+    if inspect {
+        state
+            .node
+            .refresh_tailscale()
+            .await
+            .map_err(|err| err.to_string())?;
+    }
     Ok(())
+}
+#[tauri::command]
+async fn refresh_tailscale(state: tauri::State<'_, Desktop>) -> Result<(), String> {
+    state
+        .node
+        .refresh_tailscale()
+        .await
+        .map_err(|err| err.to_string())
 }
 #[tauri::command]
 async fn dispatch(state: tauri::State<'_, Desktop>, action: Action) -> Result<(), String> {
@@ -299,6 +321,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_state,
             save_network,
+            refresh_tailscale,
             dispatch,
             send_chat_message,
             choose_share_files,

@@ -103,8 +103,8 @@ async fn execute(node: &Node, command: Command) -> Result<Value> {
                 .await
                 .expect_err("A cancelled join accepted a late grant");
             ensure!(
-                error.to_string() == "Join was cancelled",
-                "Expected a verified late grant to be discarded, got: {error}"
+                error.to_string() == "Join was cancelled or replaced",
+                "Expected the cancelled attempt to be rejected before another request, got: {error}"
             );
         }
         Command::Cancel => node.shared.lock().await.cancel_join()?,

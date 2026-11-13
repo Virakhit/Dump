@@ -4,6 +4,62 @@ use crate::engine::Engine;
 use crate::lan_invite;
 use libp2p::multiaddr::Protocol;
 
+#[cfg(windows)]
+#[tokio::test]
+async fn strict_workspace_rejects_lan_invitation_creation() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let shared = Engine::open(root.path(), Arc::new(|_| {}))?;
+    let mut e = shared.lock().await;
+    e.create_workspace("Strict LAN guard".into())?;
+    let workspace = e.persisted.active.unwrap();
+    e.persisted.workspace_network.insert(
+        workspace,
+        crate::overlay::WorkspaceNetworkPolicy::TailscaleOnly,
+    );
+    assert!(
+        e.create_lan_invite().is_err(),
+        "Strict workspace exported a LAN invitation"
+    );
+    Ok(())
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn strict_workspace_rejects_lan_protocol_even_with_valid_code() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let shared = Engine::open(root.path(), Arc::new(|_| {}))?;
+    let code = {
+        let mut e = shared.lock().await;
+        e.create_workspace("Strict LAN protocol".into())?;
+        let url = e.create_lan_invite()?;
+        let workspace = e.persisted.active.unwrap();
+        // Keep a valid token to isolate the inbound policy check itself.
+        e.persisted.workspace_network.insert(
+            workspace,
+            crate::overlay::WorkspaceNetworkPolicy::TailscaleOnly,
+        );
+        lan_invite::parse_url(&url)?
+    };
+    let peer = libp2p::identity::Keypair::generate_ed25519()
+        .public()
+        .to_peer_id();
+    assert!(
+        handle_lan_invite(
+            shared.clone(),
+            peer,
+            LanInviteRequest {
+                code,
+                name: Some("Unapproved LAN peer".into())
+            }
+        )
+        .await
+        .is_err(),
+        "LAN protocol bypassed strict workspace transport policy"
+    );
+    assert!(shared.lock().await.pending.is_empty());
+    Ok(())
+}
+
 #[derive(Default)]
 struct Nodes(Vec<Node>);
 
@@ -368,15 +424,19 @@ async fn lan_protocol_requires_discovery_and_rejects_tcp_even_for_a_lan_peer() -
             .await
             .pending
             .contains_key(&member_peer.to_string()));
+        // Bypass the client-side pending-join guard to exercise server denial
+        // of a LAN-only invitation on the ordinary control protocol.
+        let mut ordinary = b.control.clone().open_stream(owner_peer, CONTROL).await?;
+        write_frame(
+            &mut ordinary,
+            &Request::Join {
+                invitation: *invitation,
+                name: "Member".into(),
+            },
+        )
+        .await?;
         assert!(matches!(
-            b.request(
-                owner_peer,
-                &Request::Join {
-                    invitation: *invitation,
-                    name: "Member".into(),
-                },
-            )
-            .await?,
+            read_frame::<_, Response>(&mut ordinary).await?,
             Response::Denied
         ));
 
@@ -455,12 +515,12 @@ async fn full_invite_progress_requires_an_owner_ack_and_ignores_replaced_join() 
         );
         assert!(!owner.lock().await.view().pending.is_empty());
         member.lock().await.cancel_join()?;
-        b.poll_join(invitation.clone()).await?;
+        assert!(b.poll_join(invitation.clone()).await.is_err());
         assert_eq!(member.lock().await.view().join_stage, None);
         // The old request's acknowledgment must not advance another join attempt.
         let newer_invite = owner.lock().await.create_invite()?;
         member.lock().await.join(&newer_invite)?;
-        b.poll_join(invitation).await?;
+        assert!(b.poll_join(invitation).await.is_err());
         assert_eq!(
             member.lock().await.view().join_stage,
             Some("contacting_owner")

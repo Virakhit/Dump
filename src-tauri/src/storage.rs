@@ -33,6 +33,24 @@ impl Store {
         ensure!(state.version == VERSION, "Unsupported local state version");
         state.key()?;
         ensure!(state.contacts.len() <= 256, "Too many cached contacts");
+        ensure!(
+            state.overlay_contacts.len() <= 256,
+            "Too many cached overlay contacts"
+        );
+        ensure!(
+            state
+                .overlay_contacts
+                .iter()
+                .all(|(key, contact)| *key == contact.cache_key()),
+            "Invalid overlay contact cache key"
+        );
+        ensure!(
+            state
+                .workspace_network
+                .keys()
+                .all(|id| state.workspaces.contains_key(id)),
+            "Network policy refers to an unknown workspace"
+        );
         for workspace in state.workspaces.values() {
             workspace.snapshot.verify()?;
         }

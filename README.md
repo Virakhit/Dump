@@ -60,6 +60,24 @@ for local setup, delivery states, and a multi-device check.
 
 The published installer above does not include this source-only feature.
 
+## Tailscale (source build)
+
+The current source adds **Use installed Tailscale** in Network settings and a
+per-workspace **Tailscale only** policy. Install and sign in to Tailscale separately
+on both Windows devices, enable the adapter in Dump, then use **Invite via
+Tailscale**. Device fingerprints and explicit workspace approval still apply.
+Existing approved members can exchange a Tailscale connection link without
+joining the workspace again or requiring the owner online.
+
+This uses the local Tailscale peer map and fixed TCP/UDP port 42043 instead of LAN
+multicast discovery. Same-tailnet devices and shared machines are supported by the
+implementation; sharing one host does not connect every pair of members.
+Tailscale-only traffic never silently falls back to LAN/public/Dump-relay routes.
+Valid incoming links wait through adapter startup; enable Tailscale in settings
+if it was previously disabled. See [setup and limits](docs/TAILSCALE.md) and the
+[verification record](docs/VERIFICATION.md) for actual evidence and outstanding
+physical-network checks. Older installers do not contain this feature.
+
 ## Privacy and limits
 
 - QUIC authenticates device keys and encrypts traffic; workspace membership is checked separately on every request.

@@ -319,3 +319,168 @@ The workflow already retains bounded Rust failure output and runs the affected c
 **NOT RUN — all eight physical acceptance scenarios** in [NETWORK_ACCEPTANCE.md](NETWORK_ACCEPTANCE.md). Device inventory offers only the same local desktop (connector status Offline); no second/third authorized Windows device, reachable owned relay or controlled different-network endpoint is available. The plan records source/build/topology/actual route/file SHA-256 and sanitized stage evidence for offline LAN, cross-network direct/relay, UDP-blocked TCP, co-hosted owner/relay, relay loss, long-session/address changes and eventual signed revocation. Missing operator controls for a same-session connection order are explicitly untested. Loopback, simulated clock advances and CI cannot replace these gates.
 
 No migration or compatibility format changed in this closure patch: separate persisted device/relay identities, signed workspace/manifest state, remote relay pins, opt-in hosting and all existing limits remain as in `c92f6c4`. Native warning/error layout/interaction, physical firewall/NAT/CGNAT behavior and the source-built multi-device acceptance matrix remain necessary before general distribution. At completion of local verification, no commit/push, installer/version/update-channel change, release or infrastructure deployment had been performed. Subsequent user-authorized commit/push does not extend the recorded baseline CI coverage to this patch.
+
+## Installed Tailscale integration — 2026-11-13
+
+This implementation is on `codex/tailscale`, based on `05e1569`, in the managed
+`dump-tailscale` worktree. The older installed/published 0.1.3 binary does not
+contain these changes. Both peers need a supporting build and a new
+`dump://tailscale/` invitation or approved-member connection link; the old short
+LAN link still uses LAN discovery.
+
+### Scope and local evidence
+
+- External Windows client inspection uses the fixed installed CLI, bounded
+  output and a three-second timeout. Signed contacts identify node ID/FQDN;
+  addresses come from each receiver's local peer map. New persistence fields
+  default to the legacy policy, preserving the existing device identity and
+  workspace formats.
+- Dedicated TCP/QUIC port 42043 listeners and separate stream controls enforce
+  Tailscale-only policy for join, control, catalog, file, chat and contact
+  exchange. Same-peer legacy sockets cannot satisfy this policy. The status
+  says Via Tailscale without claiming knowledge of its direct/DERP tunnel.
+- Actual authenticated loopback tests use independent temporary identities and
+  test-only locator translation. They cover asymmetric recipient initiation,
+  explicit approval, file hashes/chat both ways over QUIC and TCP/Noise,
+  wrong-peer/outsider denial, policy changes, active receive interruption and
+  partial cleanup, reconnect without automatic file retry, and returning to LAN.
+- The installed-client smoke uses the production inspector and actual local
+  Tailscale IP listeners, verifies a signed link and unchanged temporary-profile
+  identity. It is separate from loopback tests and does not contact a second
+  Dump device.
+
+### Failed attempts and corrections
+
+The MSVC baseline could not link because `link.exe` is absent. Validation uses
+`stable-x86_64-pc-windows-gnu` and the existing local MinGW tools, with
+`CARGO_BUILD_JOBS=1` after memory pressure. Rustfmt uses the installed default
+component. This is Windows-local evidence; no new remote CI run is claimed.
+
+A fresh whole-change review found four issues. Each had an observed failing
+regression before correction: a cancelled scheduled join could lose its strict
+route; changing back to legacy could strand a peer behind the old socket;
+startup could discard valid links before adapter readiness; and a maximum
+128-member roster exceeded the overlay frame. Fixes capture join epoch/context,
+close obsolete connections, persist pending links across startup, and exchange
+bounded references to the authenticated current roster instead of full rosters
+in 8 KiB frames.
+
+Broad-suite runs also exposed two listener lifecycle defects. Listener ownership
+now follows ListenerId so delayed old close events cannot erase replacement
+addresses. A busy fixed port retries after four seconds independently of CLI
+refresh; a real UDP-blocker regression failed before the fix and recovered
+without settings changes afterward. QUIC outbound overlay dials allocate new
+ports so closing/draining streams do not retain the fixed listener socket on
+logout. The reconnect test kept its original 15-second deadline.
+
+The first broad attempt after that fix passed 103 cases but failed a legacy
+owner-restart case: an explicit connect raced an existing background dial. A
+bound-but-unanswered UDP regression reproduced the same error deterministically.
+Route registration now acknowledges an already-pending dial without reporting
+handshake success or suppressing other errors. The observed RED and subsequent
+GREEN logs remain separate; failed attempts are not counted as final passes.
+
+### External acceptance boundary
+
+Physical two-device transfer, same-tailnet cross-network behavior, one-way
+cross-tailnet sharing, actual shared-IP remapping, node rename, real grants and
+Windows Firewall, observed DERP/direct transfer, IPv6, owner-offline group
+behavior, files larger than 4 GiB, and clean-machine installer/deep-link handling
+remain **NOT RUN**. Requirements are recorded in
+[NETWORK_ACCEPTANCE.md](NETWORK_ACCEPTANCE.md); fixtures and local socket success
+do not satisfy those rows. No tailnet policy, firewall rule, installed Dump
+profile, updater feed or remote infrastructure was changed.
+The outbound-port adjustment alone did not eliminate the broad-suite rebind
+race: another attempt passed 104 cases and failed reconnect. The deterministic
+listener-retention assertion then failed on the old lifecycle. Temporary status
+loss now keeps validated sockets and transport classification while readiness
+is false, application requests/dials are rejected and live overlay connections
+are cancelled/closed. Explicit disable or newly validated IP changes retires
+bindings. An intermediate broad snapshot passed 124 cases, before the final
+additional guards below.
+
+A narrow follow-up inspection found the dedicated LAN invitation protocol lacked
+the guard used by the other application protocols. Regressions for strict-mode
+LAN creation/admission, legacy-handler exclusion on dedicated sockets, and
+pending outbound transport classification during peer-map loss all failed
+before correction. LAN creation/handling now checks the workspace transport
+policy, dedicated listeners never receive legacy handlers, and suspension
+preserves classification without permitting new traffic. The final broad
+results below apply after these corrections; intermediate runs are separate.
+
+### Final source checks
+
+Commands use the GNU toolchain above, locked dependencies and one Cargo build
+job. Rust tests use the normal parallel test runner; no enlarged reconnect
+deadline or test-thread serialization was added. Documentation edits after the
+source freeze do not change the tested application inputs.
+
+| Check | Result |
+|---|---|
+| Full `cargo test --no-default-features --locked` | PASS: 108 library + 19 integration = **127 passed**, zero failures; three explicit ignores (process worker entry, installed-client smoke, optional 8 GiB transfer). The installed-client smoke is run separately. |
+| `npm run build` | PASS: TypeScript check and Vite production bundle. |
+| `npm run test:ui` | PASS: **15/15**. |
+| Publisher contract tests | PASS: **1/1**; no updater channel was changed. |
+| Desktop library `cargo test --lib --locked` | PASS: **109 passed**, zero failures, two explicit ignored entries, after the local GNU test-resource accommodation below. |
+| Installed-client smoke, explicitly run with `--ignored --exact` | PASS: **1/1**, production CLI and actual local Tailscale TCP/QUIC listeners; no second-machine traffic. |
+| Default-desktop `cargo clippy --all-targets --locked -- -D warnings` | PASS. |
+| Rustfmt and staged whitespace check | PASS. |
+
+The first desktop invocation compiled successfully but executed no tests: Windows
+returned `0xc0000139` before the harness started. A direct import/export probe
+identified `comctl32!TaskDialogIndirect`; the GNU unit-test executable contained
+Rust's default manifest without the Common Controls v6 dependency. An external
+sidecar manifest was ignored because the executable already had an embedded
+manifest. Adding that dependency to **the generated test executable's
+RT_MANIFEST resource only**, retaining its long-path/asInvoker settings, made
+`--list` succeed (111 discovered tests), then the full desktop suite passed.
+No test code, application source, assertions, routes or deadlines changed for
+this accommodation. The initial failed log is retained separately. This is a
+local GNU test-binary workaround, not evidence of a clean-machine test or a
+claim that unmodified GNU `cargo test --lib` works on every host. The normal
+Tauri application has its own application manifest; packaging checks it
+separately. MSVC execution remains unavailable because `link.exe` is missing.
+
+### Local installer preview
+
+**PASS — built, not installed or published:**
+`.tools/tailscale-preview/Dump_0.1.4-alpha.1_x64-setup.exe` in this worktree,
+279,715,628 bytes (266.76 MiB). The copied artifact matches the build output:
+
+```text
+SHA-256: c30ac9b553ff0983eb4d3f2cb6d819e77cb817586589059e615f99827b6a10a9
+```
+
+The adjacent `.exe.sha256` repeats the checksum. The preview uses a local ignored
+config override `version=0.1.4-alpha.1` and
+`bundle.createUpdaterArtifacts=false`; tracked package/config versions remain
+0.1.3. Build command, with the GNU PATH/target directory and one build job:
+
+```powershell
+npm run tauri -- build --debug --bundles nsis --config .tools/tailscale-preview.json --ci --no-sign -- --locked --config profile.dev.package.dump.debug-assertions=false
+```
+
+This is an unoptimized local preview with a production frontend bundle. The
+root package's debug assertions are disabled for this build so the main binary
+uses the Windows GUI subsystem (verified PE subsystem 2). The NSIS recipe
+includes the x64 WebView2Loader DLL and offline WebView2 installer. There is no
+AuthentiCode or updater signing for this preview; no private signing key or
+updater feed was used or changed.
+
+The GNU linker emitted a multiple-non-default-manifests warning. Inspection of
+the final application resource confirmed the Common Controls v6 dependency;
+it did not reproduce the unit-test loader failure. The default Rust manifest
+was not merged into this preview, so its long-path activation settings are not
+claimed. A controlled GDB launch reached the validated C `main` breakpoint and
+was terminated before app setup, single-instance handling or workspace/profile
+code executed. This proves loader startup only, not a rendered window, install,
+URL registration or two-device operation. The first probe script used an
+unsupported GDB startup option and exited before launching; its failure was
+retained and the corrected probe passed. GDB also reported DWARF symbol-map
+warnings; the breakpoint and successful loader result were observed directly.
+
+Finish transfers and close Dump before installing the preview manually on both
+devices. Enable **Use installed Tailscale**, select **Tailscale only** for the
+workspace, create a new **Invite via Tailscale**, and compare fingerprints before
+approval. Follow [TAILSCALE.md](TAILSCALE.md); old LAN links do not select this
+transport. Actual installation and the physical-network gates remain NOT RUN.

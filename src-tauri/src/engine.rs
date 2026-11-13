@@ -20,6 +20,8 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 pub type Shared = Arc<Mutex<Engine>>;
+#[path = "engine_overlay.rs"]
+mod overlay_engine;
 pub type Notify = Arc<dyn Fn(View) + Send + Sync>;
 pub(crate) const PARTIAL_CLEANUP_FAILED: &str = "Cannot remove a temporary download. Close any program using it and restart Dump to retry cleanup.";
 
@@ -53,6 +55,7 @@ pub struct Transfer {
     pub peer_id: String,
     pub direction: String,
     pub relayed: bool,
+    pub tailscale: bool,
     pub bytes: u64,
     pub total: u64,
     pub status: String,
@@ -80,9 +83,21 @@ pub struct View {
     pub invite_url: Option<String>,
     pub last_error: Option<String>,
     pub network: crate::relay_host::Settings,
+    pub tailscale: TailscaleView,
+    pub network_policy: crate::overlay::WorkspaceNetworkPolicy,
+}
+
+#[derive(Clone, Serialize)]
+pub struct TailscaleView {
+    pub state: crate::tailscale::TailscaleState,
+    pub listener_ready: bool,
 }
 
 pub struct Engine {
+    pub tailscale: crate::tailscale::TailscaleSnapshot,
+    pub overlay_listener_ready: bool,
+    pub(crate) tailscale_generation: u64,
+    pub(crate) network_epoch: u64,
     pub persisted: Persisted,
     pub key: Keypair,
     pub relay_key: Keypair,
@@ -133,6 +148,10 @@ impl Engine {
         let key = persisted.key()?;
         let relay_key = persisted.relay_key()?;
         Ok(Arc::new(Mutex::new(Self {
+            tailscale: Default::default(),
+            overlay_listener_ready: false,
+            tailscale_generation: 0,
+            network_epoch: 0,
             persisted,
             key,
             relay_key,
@@ -271,6 +290,11 @@ impl Engine {
             invite_url: self.invite_url.clone(),
             last_error: self.last_error.clone(),
             network: self.persisted.network.clone(),
+            tailscale: TailscaleView {
+                state: self.tailscale.state,
+                listener_ready: self.overlay_listener_ready,
+            },
+            network_policy: self.overlay_policy(),
         }
     }
     pub fn compose_chat(
@@ -442,6 +466,7 @@ impl Engine {
         Ok(())
     }
     pub(crate) fn reset_runtime(&mut self) {
+        self.network_epoch = self.network_epoch.wrapping_add(1);
         for token in self.cancellations.values() {
             token.cancel();
         }
@@ -460,6 +485,7 @@ impl Engine {
         self.join_request_submitted = false;
     }
     pub fn create_lan_invite(&mut self) -> Result<String> {
+        self.check_transport(false)?;
         let snapshot = self.active_snapshot()?;
         ensure!(
             snapshot.owner_peer_id == self.peer(),
@@ -643,6 +669,9 @@ impl Engine {
         Ok(())
     }
     pub fn join(&mut self, value: &str) -> Result<()> {
+        if value.trim().starts_with(crate::overlay::PREFIX) {
+            return self.join_overlay(value);
+        }
         if value.trim().starts_with(lan_invite::PREFIX) {
             let code = lan_invite::parse_url(value)?;
             self.expire_lan_invites();
@@ -653,6 +682,7 @@ impl Engine {
             if self.persisted.joining.is_some() {
                 let mut next = self.persisted.clone();
                 next.joining = None;
+                next.overlay_joining = None;
                 self.persist(next)?;
             }
             self.lan_joining = Some(LanJoin {
@@ -660,6 +690,7 @@ impl Engine {
                 expires_at: now().saturating_add(lan_invite::LIFETIME),
                 owner_peer_id: None,
             });
+            self.network_epoch = self.network_epoch.wrapping_add(1);
             self.join_request_submitted = false;
             self.last_error = None;
             self.emit();
@@ -678,16 +709,20 @@ impl Engine {
         }
         let mut next = self.persisted.clone();
         next.joining = Some(invite);
+        next.overlay_joining = None;
         self.persist(next)?;
+        self.network_epoch = self.network_epoch.wrapping_add(1);
         self.lan_joining = None;
         self.join_request_submitted = false;
         self.emit();
         Ok(())
     }
     pub fn cancel_join(&mut self) -> Result<()> {
+        self.network_epoch = self.network_epoch.wrapping_add(1);
         if self.persisted.joining.is_some() {
             let mut next = self.persisted.clone();
             next.joining = None;
+            next.overlay_joining = None;
             self.persist(next)?;
         }
         self.lan_joining = None;
@@ -970,6 +1005,7 @@ impl Engine {
                 peer_id: peer.into(),
                 direction: direction.into(),
                 relayed: false,
+                tailscale: false,
                 bytes: 0,
                 total: manifest.size,
                 status: "Queued".into(),
@@ -1180,18 +1216,41 @@ pub async fn refresh_share(shared: Shared, old: LocalShare) -> Result<()> {
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Action {
-    CreateWorkspace { name: String },
-    Activate { id: Uuid },
-    SetName { name: String },
+    CreateWorkspace {
+        name: String,
+    },
+    Activate {
+        id: Uuid,
+    },
+    SetName {
+        name: String,
+    },
     CreateLanInvite,
     CreateInvite,
-    Join { invite: String },
+    CreateOverlayInvite,
+    CreateOverlayConnect,
+    SetNetworkPolicy {
+        policy: crate::overlay::WorkspaceNetworkPolicy,
+    },
+    Join {
+        invite: String,
+    },
     CancelJoin,
-    Approve { peer_id: String },
-    Reject { peer_id: String },
-    RemoveMember { peer_id: String },
-    Unshare { id: Uuid },
-    CancelTransfer { id: Uuid },
+    Approve {
+        peer_id: String,
+    },
+    Reject {
+        peer_id: String,
+    },
+    RemoveMember {
+        peer_id: String,
+    },
+    Unshare {
+        id: Uuid,
+    },
+    CancelTransfer {
+        id: Uuid,
+    },
     DismissError,
 }
 pub fn dispatch(engine: &mut Engine, action: Action) -> Result<()> {
@@ -1201,6 +1260,9 @@ pub fn dispatch(engine: &mut Engine, action: Action) -> Result<()> {
         Action::SetName { name } => engine.set_name(name),
         Action::CreateLanInvite => engine.create_lan_invite().map(|_| ()),
         Action::CreateInvite => engine.create_invite().map(|_| ()),
+        Action::CreateOverlayInvite => engine.create_overlay_invite().map(|_| ()),
+        Action::CreateOverlayConnect => engine.create_overlay_connect().map(|_| ()),
+        Action::SetNetworkPolicy { policy } => engine.set_network_policy(policy),
         Action::Join { invite } => engine.join(&invite),
         Action::CancelJoin => engine.cancel_join(),
         Action::Approve { peer_id } => engine.approve(&peer_id),

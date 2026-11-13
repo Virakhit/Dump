@@ -20,6 +20,8 @@ pub(crate) struct Streams {
     inner: Toggle<libp2p_stream::Behaviour>,
     route: Route,
     connections: BTreeSet<ConnectionId>,
+    overlay_scope: Option<crate::overlay_routes::SharedOverlayScope>,
+    overlay_only: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -76,6 +78,8 @@ impl Streams {
             inner: Some(libp2p_stream::Behaviour::new()).into(),
             route,
             connections: BTreeSet::new(),
+            overlay_scope: None,
+            overlay_only: false,
         }
     }
 
@@ -85,6 +89,33 @@ impl Streams {
             .as_ref()
             .expect("stream behaviour is enabled")
             .new_control()
+    }
+
+    pub fn with_overlay_scope(mut self, scope: crate::overlay_routes::SharedOverlayScope) -> Self {
+        self.overlay_scope = Some(scope);
+        self
+    }
+
+    pub fn overlay(scope: crate::overlay_routes::SharedOverlayScope) -> Self {
+        let mut streams = Self::new(false).with_overlay_scope(scope);
+        streams.overlay_only = true;
+        streams
+    }
+
+    fn scope_allowed(&self, local: Option<&Multiaddr>, remote: &Multiaddr) -> bool {
+        self.overlay_scope.as_ref().is_none_or(|scope| {
+            scope
+                .read()
+                .map(|scope| {
+                    let overlay = scope.contains(local, remote);
+                    if self.overlay_only {
+                        overlay
+                    } else {
+                        !overlay && !local.is_some_and(|address| scope.owns_listener(address))
+                    }
+                })
+                .unwrap_or(false)
+        })
     }
 
     fn accepts(&self, peer: PeerId, address: &Multiaddr) -> bool {
@@ -120,7 +151,7 @@ impl NetworkBehaviour for Streams {
             }
             _ => self.accepts(peer, local),
         };
-        if accepted {
+        if accepted && self.scope_allowed(Some(local), remote) {
             self.inner
                 .handle_established_inbound_connection(id, peer, local, remote)
         } else {
@@ -137,7 +168,7 @@ impl NetworkBehaviour for Streams {
         role: Endpoint,
         port: PortUse,
     ) -> Result<THandler<Self>, ConnectionDenied> {
-        if self.accepts(peer, address) {
+        if self.accepts(peer, address) && self.scope_allowed(None, address) {
             self.inner
                 .handle_established_outbound_connection(id, peer, address, role, port)
         } else {
@@ -156,7 +187,11 @@ impl NetworkBehaviour for Streams {
                         lan_endpoint(e.peer_id, e.endpoint, allow_loopback)
                     }
                 };
-                if !accepted {
+                let local = match e.endpoint {
+                    ConnectedPoint::Listener { local_addr, .. } => Some(local_addr),
+                    _ => None,
+                };
+                if !accepted || !self.scope_allowed(local, e.endpoint.get_remote_address()) {
                     return;
                 }
                 self.connections.insert(e.connection_id);
@@ -186,7 +221,9 @@ impl NetworkBehaviour for Streams {
             match self.inner.poll(cx) {
                 // LAN callers explicitly dial a current mDNS address in the actor.
                 // Never let an open/close race fall back to a public or relay route.
-                Poll::Ready(ToSwarm::Dial { opts }) if matches!(self.route, Route::Lan { .. }) => {
+                Poll::Ready(ToSwarm::Dial { opts })
+                    if self.overlay_only || matches!(self.route, Route::Lan { .. }) =>
+                {
                     let error = libp2p::swarm::DialError::NoAddresses;
                     self.inner.on_swarm_event(FromSwarm::DialFailure(
                         libp2p::swarm::behaviour::DialFailure {
@@ -207,6 +244,22 @@ impl NetworkBehaviour for Streams {
 mod tests {
     use super::*;
     use futures::Future;
+
+    #[test]
+    fn dedicated_overlay_listener_never_gets_legacy_handlers() {
+        let scope = crate::overlay_routes::SharedOverlayScope::default();
+        scope
+            .write()
+            .unwrap()
+            .local
+            .insert("100.80.1.1".parse().unwrap());
+        let legacy = Streams::new(false).with_overlay_scope(scope.clone());
+        let overlay = Streams::overlay(scope);
+        let local: Multiaddr = "/ip4/100.80.1.1/tcp/42043".parse().unwrap();
+        let non_overlay_source: Multiaddr = "/ip4/192.168.1.3/tcp/53000".parse().unwrap();
+        assert!(!legacy.scope_allowed(Some(&local), &non_overlay_source));
+        assert!(!overlay.scope_allowed(Some(&local), &non_overlay_source));
+    }
 
     #[tokio::test]
     async fn disconnected_lan_stream_fails_without_dialing_or_stranding_requests() {

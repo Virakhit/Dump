@@ -271,6 +271,12 @@ pub struct Persisted {
     pub network: crate::relay_host::Settings,
     #[serde(default)]
     pub contacts: BTreeMap<String, crate::contact::Contact>,
+    #[serde(default)]
+    pub overlay_contacts: BTreeMap<String, crate::overlay::OverlayContact>,
+    #[serde(default)]
+    pub workspace_network: BTreeMap<Uuid, crate::overlay::WorkspaceNetworkPolicy>,
+    #[serde(default)]
+    pub overlay_joining: Option<crate::overlay::OverlayContact>,
 }
 impl Persisted {
     pub fn new() -> Result<Self> {
@@ -290,6 +296,9 @@ impl Persisted {
             chat_messages: Vec::new(),
             network: Default::default(),
             contacts: Default::default(),
+            overlay_contacts: Default::default(),
+            workspace_network: Default::default(),
+            overlay_joining: None,
         })
     }
     pub fn key(&self) -> Result<Keypair> {

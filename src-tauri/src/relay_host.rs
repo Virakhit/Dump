@@ -36,6 +36,8 @@ const REFILL_BATCH: usize = 8 * 1024;
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Settings {
+    #[serde(default)]
+    pub use_tailscale: bool,
     pub help_network: bool,
     pub public_addresses: Vec<String>,
     pub relays: Vec<String>,

@@ -225,6 +225,14 @@ async fn owner_also_hosts_relay(relay_first: bool) -> Result<()> {
             vec![owner_route.to_string()],
             true,
         )?);
+        {
+            let mut e = member.lock().await;
+            let mut next = e.persisted.clone();
+            next.joining = Some(invite.clone());
+            e.persist(next)?;
+            e.network_epoch = e.network_epoch.wrapping_add(1);
+            e.emit();
+        }
         if relay_first {
             relay_reservation(&b, relay_peer, relay_address.clone()).await?;
             eprintln!("identity relay-first: reservation ready; app-route dial requested");
@@ -248,13 +256,6 @@ async fn owner_also_hosts_relay(relay_first: bool) -> Result<()> {
                     .err()
                     .map_or_else(|| "unexpected response".into(), |e| format!("{e:#}"))
             );
-        }
-        {
-            let mut e = member.lock().await;
-            let mut next = e.persisted.clone();
-            next.joining = Some(invite);
-            e.persist(next)?;
-            e.emit();
         }
         state_stage("owner join request", &owner, &mut owner_updates, &b, |v| {
             v.pending.iter().any(|p| p.peer_id == member_peer)

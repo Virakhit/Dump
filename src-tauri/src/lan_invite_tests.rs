@@ -34,6 +34,10 @@ pub(crate) fn engine(directory: &Path) -> Result<Engine> {
     );
     persisted.active = Some(workspace_id);
     Ok(Engine {
+        tailscale: Default::default(),
+        overlay_listener_ready: false,
+        tailscale_generation: 0,
+        network_epoch: 0,
         persisted,
         key,
         relay_key,

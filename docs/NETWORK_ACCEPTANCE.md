@@ -89,6 +89,31 @@ Approve A and C in B's workspace; C shares a sufficiently long synthetic file, a
 
 If C is isolated from B and still has an older signed roster, continued old permission before the update is an eventual-revocation limitation, not proof of a bypass. Record the partition, revision arrival and enforcement time; there is no universal revocation deadline during isolation. Missing revision-arrival evidence leaves that enforcement checkpoint NOT OBSERVED. A two-device owner/provider test can be recorded separately but cannot replace the third-device propagation gate.
 
-## Results and missing equipment
+## Tailscale acceptance addendum — 2026-11-13
+
+Use the supporting source build on both devices and follow [TAILSCALE.md](TAILSCALE.md).
+The original eight Internet/relay scenarios retain their recorded status.
+Record source revision/build hashes and use synthetic files; keep invitation
+tokens, full status JSON, account details and keys out of evidence. No firewall
+or tailnet policy is changed automatically.
+
+| Case | Status | Required evidence |
+|---|---|---|
+| Local installed client and bound Tailscale interfaces | PASS (local smoke) | A fresh temporary Dump profile read the installed client, opened actual Tailscale TCP/QUIC listeners on 42043, issued a valid signed invitation and retained its identity. This does not prove a remote port is reachable. |
+| Two Windows devices in one tailnet on different physical networks | NOT RUN | Open link, compare fingerprints, explicitly approve, file hash and chat in both directions; owner offline after approval. |
+| One-way machine sharing between different tailnets | NOT RUN | Recipient initiates; shared host sends back through the same authenticated connection; reconnect is initiated by the reachable side. |
+| Three devices with partial sharing visibility | NOT RUN | No implicit B-to-C access through shared host A; add the intended pairwise sharing and verify member operations. |
+| Shared-machine IP collision/remapping and renamed locator | NOT RUN | Match signed node ID/FQDN to the receiver's actual peer map; never dial the sender's raw IP or another same-named device. |
+| Actual Tailscale DERP/direct paths, IPv4/IPv6, grants and Windows Firewall | NOT RUN | Record observed path and verified file behavior under approved policy; a Tailscale ping does not establish Dump application success. |
+| Real interface loss, logout/login and occupied port | NOT RUN (physical) | Safely terminate partial receives, clean owned files, restore listeners and reconnect without automatically retrying files. Real-socket simulations cover these changes separately. |
+| Large file and installation/deep links on a clean second machine | NOT RUN | File larger than 4 GiB with hash/memory observations, actual installer/URL handling with app open and closed, preserved identity and old workspace data. |
+
+Automated socket tests use independent identities and test-only loopback locator
+translation. They cover asymmetric initiation, QUIC and TCP/Noise file/chat,
+policy isolation, interruption/reconnect and returning to LAN; they do not
+satisfy the physical rows above. Keep build/toolchain limitations and failed
+attempts in the verification record instead of promoting them to PASS.
+
+## Results and missing equipment (original eight scenarios)
 
 No physical-network attempt has been executed by creating this document. All scenario statuses remain NOT RUN. Supply the authorized device/network/relay inventory and operator availability before execution; no public or third-party endpoints are assumed. After each attempt, keep its sanitized record and add actual outcomes to [VERIFICATION.md](VERIFICATION.md), separately from historical loopback/CI evidence. A PASS applies only to that recorded topology, route and build; it is not universal NAT support or release acceptance.
