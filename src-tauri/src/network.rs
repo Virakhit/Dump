@@ -28,8 +28,16 @@ use uuid::Uuid;
 
 const CONTROL: StreamProtocol = StreamProtocol::new("/dump/control/1");
 const FILE: StreamProtocol = StreamProtocol::new("/dump/file/1");
+const CHAT: StreamProtocol = StreamProtocol::new("/dump/chat/2");
 const PREAUTH_TIMEOUT: Duration = Duration::from_secs(5);
 const INACTIVITY: Duration = Duration::from_secs(30);
+
+#[path = "network_chat.rs"]
+mod chat_network;
+#[path = "network_host.rs"]
+mod network_host;
+#[path = "network_routes.rs"]
+mod network_routes;
 
 #[derive(NetworkBehaviour)]
 struct Behaviour {
@@ -111,6 +119,7 @@ pub async fn read_frame<S: AsyncRead + Unpin, T: DeserializeOwned>(stream: &mut 
 
 type PeerSlots = (Arc<Semaphore>, Arc<Semaphore>);
 struct Limits {
+    chat_send: Arc<Semaphore>,
     send: Arc<Semaphore>,
     receive: Arc<Semaphore>,
     peers: Mutex<BTreeMap<PeerId, PeerSlots>>,
@@ -118,6 +127,7 @@ struct Limits {
 impl Limits {
     fn new() -> Self {
         Self {
+            chat_send: Arc::new(Semaphore::new(4)),
             send: Arc::new(Semaphore::new(2)),
             receive: Arc::new(Semaphore::new(2)),
             peers: Mutex::new(BTreeMap::new()),
@@ -139,6 +149,9 @@ impl Limits {
 
 #[derive(Clone)]
 pub struct Node {
+    host: Arc<network_host::Hub>,
+    own_peer: PeerId,
+    discovery: bool,
     pub shared: Shared,
     pub control: Control,
     dial: mpsc::Sender<(PeerId, Multiaddr)>,
@@ -189,11 +202,19 @@ impl Node {
         let mut control = swarm.behaviour().streams.new_control();
         let mut incoming = control.accept(CONTROL)?;
         let mut files = control.accept(FILE)?;
+        let mut chats = control.accept(CHAT)?;
+        let mut route_queries = network_routes::accept(&mut control)?;
+        let (mut host_calls, mut host_sources) = network_host::accept(&mut control)?;
         let (dial, mut dials) = mpsc::channel(128);
         let (address_tx, addresses) = watch::channel(Vec::new());
         let limits = Arc::new(Limits::new());
         let shutdown = CancellationToken::new();
         let node = Self {
+            host: Arc::new(network_host::Hub::new(
+                shared.lock().await.relay_active.clone(),
+            )),
+            own_peer: peer,
+            discovery,
             shared: shared.clone(),
             control: control.clone(),
             dial,
@@ -204,10 +225,18 @@ impl Node {
         let poll_node = node.clone();
         let incoming_slots = Arc::new(Semaphore::new(32));
         let incoming_file_slots = Arc::new(Semaphore::new(8));
+        let incoming_chat_slots = Arc::new(Semaphore::new(8));
+        let incoming_route_slots = Arc::new(Semaphore::new(8));
+        let incoming_host_slots = Arc::new(Semaphore::new(8));
+        let incoming_source_slots = Arc::new(Semaphore::new(4));
         tokio::spawn(async move {
             let mut discovered: BTreeMap<PeerId, Vec<Multiaddr>> = BTreeMap::new();
             let in_flight = Arc::new(Mutex::new(BTreeSet::new()));
             let mut last_join = 0;
+            let mut connections = BTreeMap::new();
+            let mut dialing = BTreeMap::new();
+            let mut planner = crate::route_selection::DialPlanner::default();
+            let mut route_refresh = BTreeMap::<PeerId, Instant>::new();
             let mut tick = tokio::time::interval(Duration::from_secs(2));
             let mut listeners = Vec::new();
             loop {
@@ -230,9 +259,36 @@ impl Node {
                             tokio::spawn(async move { let _permit = permit; let _ = serve_file(state, limits, peer, stream).await; });
                         }
                     },
+                    Some((peer, stream)) = chats.next() => {
+                        if let Ok(permit) = incoming_chat_slots.clone().try_acquire_owned() {
+                            let state = shared.clone(); let stop = shutdown.clone();
+                            tokio::spawn(async move {
+                                let _permit = permit;
+                                tokio::select! { _ = stop.cancelled() => {}, _ = chat_network::serve(state, peer, stream) => {} }
+                            });
+                        }
+                    },
+                    Some((peer, stream)) = route_queries.next() => {
+                        if let Ok(permit) = incoming_route_slots.clone().try_acquire_owned() {
+                            let state = shared.clone(); let stop = shutdown.clone();
+                            tokio::spawn(async move { let _permit = permit; tokio::select! { _ = stop.cancelled() => {}, _ = network_routes::serve(state, peer, stream) => {} } });
+                        }
+                    },
+                    Some((peer, stream)) = host_calls.next() => {
+                        if let Ok(permit) = incoming_host_slots.clone().try_acquire_owned() {
+                            let node = poll_node.clone(); let stop = shutdown.clone();
+                            tokio::spawn(async move { let _permit = permit; tokio::select! { _ = stop.cancelled() => {}, _ = network_host::serve(node, peer, stream) => {} } });
+                        }
+                    },
+                    Some((peer, stream)) = host_sources.next() => {
+                        if let Ok(permit) = incoming_source_slots.clone().try_acquire_owned() {
+                            let node = poll_node.clone(); let stop = shutdown.clone();
+                            tokio::spawn(async move { let _permit = permit; tokio::select! { _ = stop.cancelled() => {}, _ = network_host::serve_source(node, peer, stream) => {} } });
+                        }
+                    },
                     event = swarm.select_next_some() => match event {
                         SwarmEvent::NewListenAddr { address, .. } => {
-                            listeners.push(address); let _ = address_tx.send(listeners.clone());
+                            if !listeners.contains(&address) { listeners.push(address); } let _ = address_tx.send(listeners.clone());
                             let mut e = shared.lock().await; e.network_status = "LAN discovery is running".into(); e.emit();
                         },
                         SwarmEvent::Behaviour(BehaviourEvent::Mdns(mdns::Event::Discovered(peers))) => for (peer, address) in peers {
@@ -241,9 +297,18 @@ impl Node {
                                 if addresses.len() < 8 && !addresses.contains(&address) { addresses.push(address.clone()); swarm.add_peer_address(peer, address); }
                             }
                         },
-                        SwarmEvent::ConnectionClosed { peer_id, num_established: 0, .. } => {
+                        SwarmEvent::Behaviour(BehaviourEvent::Mdns(mdns::Event::Expired(peers))) => for (peer, address) in peers { if let Some(routes) = discovered.get_mut(&peer) { routes.retain(|route| route != &address); } },
+                        SwarmEvent::ExpiredListenAddr { address, .. } => { listeners.retain(|route| route != &address); let _ = address_tx.send(listeners.clone()); },
+                        SwarmEvent::ListenerClosed { addresses, .. } => { listeners.retain(|route| !addresses.contains(route)); let _ = address_tx.send(listeners.clone()); },
+                        SwarmEvent::ConnectionEstablished { peer_id, connection_id, .. } => { dialing.remove(&connection_id); connections.insert(connection_id, peer_id); },
+                        SwarmEvent::OutgoingConnectionError { connection_id, .. } => { dialing.remove(&connection_id); },
+                        SwarmEvent::ConnectionClosed { peer_id, connection_id, num_established, .. } => {
+                            connections.remove(&connection_id);
+                            if num_established != 0 { continue; }
                             let mut e = shared.lock().await; e.online.remove(&peer_id.to_string()); e.remote.retain(|_,m| m.owner_peer_id != peer_id.to_string());
-                            for (id,t) in &e.transfers { if t.peer_id == peer_id.to_string() { if let Some(c) = e.cancellations.get(id) { c.cancel(); } } }
+                            if e.active_snapshot().is_ok_and(|snapshot| snapshot.owner_peer_id == peer_id.to_string()) { e.relay_host_generation = None; }
+                            // Each transfer owns stream liveness/idle timeout. A direct connection
+                            // closing must not cancel setup or an authenticated indirect stream.
                             e.emit();
                         },
                         SwarmEvent::ListenerError { .. } => shared.lock().await.error("LAN listener failed; restart Dump and check Windows firewall"),
@@ -255,21 +320,45 @@ impl Node {
                         let active_peers: BTreeSet<_> = e.online.keys().cloned().collect();
                         e.remote.retain(|_,m| active_peers.contains(&m.owner_peer_id));
                         e.pending.retain(|_,p| now().saturating_sub(p.requested_at) < 86400);
+                        let online = e.online.keys().cloned().collect::<BTreeSet<_>>(); e.relay_peers.retain(|peer| online.contains(peer));
+                        if e.persisted.joining_routes.as_ref().is_some_and(|r| r.expires_at <= now()) { let _ = e.cancel_join(); e.error("Invitation expired. Ask the owner for a fresh link."); }
                         let joining = e.persisted.joining.clone();
                         let targets = e.active_snapshot().ok().filter(|s| s.contains(&e.peer())).map(|s| s.members.into_iter().filter_map(|m| m.peer_id.parse::<PeerId>().ok()).filter(|p| *p != peer).collect::<Vec<_>>()).unwrap_or_default();
+                        let mut desired = targets.clone();
+                        if let Some(invite) = &joining { if let Ok(owner) = invite.owner_peer_id.parse::<PeerId>() { desired.push(owner); } }
+                        desired.sort(); desired.dedup(); planner.retain(&desired); route_refresh.retain(|peer, _| desired.contains(peer));
+                        let mut budget = 4usize.saturating_sub(dialing.len().min(4));
+                        let priority = joining.as_ref().and_then(|invite| invite.owner_peer_id.parse::<PeerId>().ok());
+                        for target in &planner.order(&desired, priority, budget) {
+                            let connected = connections.values().any(|peer| peer == target);
+                            let mut candidates: Vec<_> = discovered.get(target).into_iter().flatten().take(8).filter_map(|address| network_routes::direct_candidate(*target, address.clone())).collect();
+                            let signed = e.persisted.joining_routes.as_ref().filter(|r| r.peer_id == target.to_string()).or_else(|| e.persisted.active.and_then(|room| e.persisted.routes.get(&format!("{room}:{target}"))));
+                            if let Some(record) = signed.filter(|r| r.verify_at(now()).is_ok()) { for route in &record.addresses { if let Ok(address) = crate::invite_routes::overlay_route(*target, route) { if !candidates.contains(&address) { candidates.push(address); } } } }
+                            let pending = dialing.values().filter(|peer| *peer == target).count();
+                            for address in planner.plan(*target, &candidates, connected, budget.min(2usize.saturating_sub(pending)), Instant::now()) {
+                                let options = libp2p::swarm::dial_opts::DialOpts::peer_id(*target).condition(libp2p::swarm::dial_opts::PeerCondition::Always).addresses(vec![address.with(libp2p::multiaddr::Protocol::P2p(*target))]).build();
+                                let id = options.connection_id();
+                                if swarm.dial(options).is_ok() { dialing.insert(id, *target); budget = budget.saturating_sub(1); }
+                                if joining.as_ref().is_some_and(|invite| invite.owner_peer_id == target.to_string()) { e.join_contacting = true; }
+                            }
+                        }
+                        let host = e.active_snapshot().ok().and_then(|snapshot| snapshot.owner_peer_id.parse::<PeerId>().ok());
+                        let relay_ready = e.relay_host_generation.is_some() && host.is_some_and(|owner| connections.values().any(|peer| *peer == owner));
                         e.emit(); drop(e);
-                        for target in targets.into_iter().filter(|p| discovered.contains_key(p)) {
+                        for target in targets.into_iter().filter(|p| (connections.values().any(|peer| peer == p) || relay_ready) && joining.as_ref().is_none_or(|invite| invite.owner_peer_id != p.to_string())) {
                             let mut ongoing = in_flight.lock().await;
                             if ongoing.insert(target) {
                                 let node = poll_node.clone(); let ongoing = in_flight.clone();
-                                tokio::spawn(async move { let _ = node.refresh_peer(target).await; ongoing.lock().await.remove(&target); });
+                                let refresh_routes = route_refresh.get(&target).is_none_or(|at| at.elapsed() >= Duration::from_secs(30));
+                                if refresh_routes { route_refresh.insert(target, Instant::now()); }
+                                tokio::spawn(async move { if refresh_routes { let _ = tokio::time::timeout(Duration::from_secs(10), node.refresh_routes(target)).await; if host == Some(target) && node.refresh_host_status(target).await.is_err() { node.shared.lock().await.relay_host_generation = None; } } let _ = node.refresh_peer(target).await; ongoing.lock().await.remove(&target); });
                             }
                         }
                         if let Some(invite) = joining {
                             if now() >= last_join + 4 {
                                 last_join = now();
                                 if let Ok(target) = invite.owner_peer_id.parse::<PeerId>() {
-                                    if discovered.contains_key(&target) {
+                                    if connections.values().any(|peer| *peer == target) {
                                         let mut ongoing = in_flight.lock().await;
                                         if ongoing.insert(target) { let node = poll_node.clone(); let ongoing = in_flight.clone(); tokio::spawn(async move { let _ = node.poll_join(invite).await; ongoing.lock().await.remove(&target); }); }
                                     }
@@ -319,6 +408,14 @@ impl Node {
                 }
             }
         });
+        let route_node = node.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(30));
+            loop {
+                tokio::select! { _ = route_node.shutdown.cancelled() => break, _ = tick.tick() => {} }
+                tokio::select! { _ = route_node.shutdown.cancelled() => break, _ = route_node.refresh_local_routes() => {} }
+            }
+        });
         Ok(node)
     }
     pub async fn connect(&self, peer: PeerId, address: Multiaddr) -> Result<()> {
@@ -326,9 +423,20 @@ impl Node {
         Ok(())
     }
     pub async fn request(&self, peer: PeerId, request: &Request) -> Result<Response> {
-        let mut control = self.control.clone();
-        let mut stream =
-            tokio::time::timeout(PREAUTH_TIMEOUT, control.open_stream(peer, CONTROL)).await??;
+        let mut stream = if let Request::Catalog { snapshot, offset } = request {
+            self.open_data_stream(
+                peer,
+                snapshot.workspace_id,
+                crate::host_relay::Purpose::Catalog { offset: *offset },
+                CONTROL,
+            )
+            .await?
+        } else {
+            let mut control = self.control.clone();
+            network_host::DataStream::direct(
+                tokio::time::timeout(PREAUTH_TIMEOUT, control.open_stream(peer, CONTROL)).await??,
+            )
+        };
         write_frame(&mut stream, request).await?;
         read_frame(&mut stream).await
     }
@@ -358,7 +466,9 @@ impl Node {
                     e.persisted
                         .joining
                         .as_ref()
-                        .is_some_and(|i| i.token == invitation.token),
+                        .is_some_and(|i| i.token == invitation.token
+                            && i.workspace_id == invitation.workspace_id
+                            && i.owner_peer_id == invitation.owner_peer_id),
                     "Join was cancelled"
                 );
                 let mut next = e.persisted.clone();
@@ -382,22 +492,41 @@ impl Node {
                     }
                 }
                 next.workspaces.insert(invitation.workspace_id, workspace);
+                if let Some(record) = &next.joining_routes {
+                    crate::invite_routes::merge_record(
+                        &mut next.routes,
+                        record.clone(),
+                        &next.workspaces[&invitation.workspace_id].snapshot,
+                    )?;
+                }
+                next.joining_routes = None;
                 e.persist(next)?;
                 e.reset_runtime();
                 e.emit();
             }
             Response::Denied => {
                 let mut e = self.shared.lock().await;
-                if e.persisted
-                    .joining
-                    .as_ref()
-                    .is_some_and(|i| i.token == invitation.token)
-                {
+                if e.persisted.joining.as_ref().is_some_and(|i| {
+                    i.token == invitation.token
+                        && i.workspace_id == invitation.workspace_id
+                        && i.owner_peer_id == invitation.owner_peer_id
+                }) {
                     e.cancel_join()?;
                     e.error("Invitation was rejected, expired, or already used. Ask the owner for a new invite.");
                 }
             }
-            Response::Waiting => {}
+            Response::Waiting => {
+                let mut e = self.shared.lock().await;
+                if e.persisted.joining.as_ref().is_some_and(|current| {
+                    current.token == invitation.token
+                        && current.workspace_id == invitation.workspace_id
+                        && current.owner_peer_id == invitation.owner_peer_id
+                }) {
+                    e.join_acknowledged = Some(digest(invitation.token.as_bytes()));
+                    e.join_contacting = true;
+                    e.emit();
+                }
+            }
             _ => bail!("Invalid join response"),
         }
         Ok(())
@@ -569,11 +698,13 @@ impl Node {
             );
             snapshot
         };
-        let mut control = self.control.clone();
         let mut stream = tokio::select! {
             _ = cancel.cancelled() => bail!("Transfer cancelled"),
-            stream = tokio::time::timeout(PREAUTH_TIMEOUT, control.open_stream(peer, FILE)) => stream??,
+            stream = self.open_data_stream(peer, manifest.workspace_id, crate::host_relay::Purpose::File { manifest: manifest.clone() }, FILE) => stream?,
         };
+        if let Some(transfer) = self.shared.lock().await.transfers.get_mut(&id) {
+            transfer.via_host = stream.via_host;
+        }
         write_frame(
             &mut stream,
             &Request::File {
@@ -701,8 +832,27 @@ pub async fn handle_control(shared: Shared, peer: PeerId, request: Request) -> R
                         && i.token_hash == hash
                         && i.expires_at > now()
                 })
-                .context("Access denied")?
-                .clone();
+                .cloned()
+                .or_else(|| {
+                    e.persisted
+                        .shared_invites
+                        .get(&hash)
+                        .filter(|record| {
+                            record.workspace_id == invitation.workspace_id
+                                && record.expires_at > now()
+                                && !record.rejected.contains(&peer.to_string())
+                        })
+                        .map(|record| InviteRecord {
+                            workspace_id: record.workspace_id,
+                            token_hash: hash.clone(),
+                            expires_at: record.expires_at,
+                            approved_peer: record
+                                .approved
+                                .contains(&peer.to_string())
+                                .then(|| peer.to_string()),
+                        })
+                })
+                .context("Access denied")?;
             if let Some(approved) = invite.approved_peer {
                 ensure!(approved == peer.to_string(), "Access denied");
                 let workspace = e
@@ -770,6 +920,27 @@ async fn serve_file(
 ) -> Result<()> {
     shared.lock().await.admit_request(&peer.to_string())?;
     let request: Request = read_frame(&mut stream).await?;
+    serve_file_request(
+        shared,
+        limits,
+        peer,
+        stream,
+        request,
+        false,
+        CancellationToken::new(),
+    )
+    .await
+}
+
+async fn serve_file_request<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
+    shared: Shared,
+    limits: Arc<Limits>,
+    peer: PeerId,
+    mut stream: S,
+    request: Request,
+    via_host: bool,
+    transport_cancel: CancellationToken,
+) -> Result<()> {
     let (manifest, share, id, cancel) = {
         let mut e = shared.lock().await;
         let result: Result<_> = (|| {
@@ -799,6 +970,9 @@ async fn serve_file(
         match result {
             Ok((manifest, share)) => {
                 let (id, cancel) = e.register_transfer(&manifest, &peer.to_string(), "Sharing");
+                if let Some(transfer) = e.transfers.get_mut(&id) {
+                    transfer.via_host = via_host;
+                }
                 (manifest, share, id, cancel)
             }
             Err(_) => {
@@ -810,6 +984,7 @@ async fn serve_file(
     };
     let result = tokio::select! {
         _ = cancel.cancelled() => Err(anyhow::anyhow!("Transfer cancelled")),
+        _ = transport_cancel.cancelled() => Err(anyhow::anyhow!("Relay workspace or membership changed")),
         result = async {
             let _peer = limits.peer(peer,true).await?.try_acquire_owned().context("Sender busy; retry shortly")?;
             let _global = limits.send.clone().try_acquire_owned().context("Sender busy; retry shortly")?;
@@ -843,7 +1018,7 @@ async fn serve_file(
             let message = err.to_string();
             e.mark_transfer(
                 id,
-                if cancel.is_cancelled() {
+                if cancel.is_cancelled() || transport_cancel.is_cancelled() {
                     "Cancelled"
                 } else {
                     "Failed"

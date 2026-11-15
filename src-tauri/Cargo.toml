@@ -15,8 +15,8 @@ required-features = ["desktop"]
 
 [features]
 default = ["desktop"]
-desktop = ["dep:tauri", "dep:tauri-plugin-dialog", "dep:tauri-plugin-deep-link", "dep:tauri-plugin-single-instance", "dep:tauri-plugin-updater"]
-updater-tests = ["desktop", "tauri/test"]
+desktop = ["dep:tauri", "dep:tauri-plugin-dialog", "dep:tauri-plugin-deep-link", "dep:tauri-plugin-single-instance"]
+updater-tests = ["desktop", "tauri/test", "dep:tauri-plugin-updater"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -27,7 +27,7 @@ base64 = "0.22"
 ciborium = "0.2"
 futures = "0.3"
 hex = "0.4"
-libp2p = { version = "0.57", features = ["tokio", "quic", "mdns", "ping", "macros", "ed25519"] }
+libp2p = { version = "0.57", features = ["tokio", "quic", "mdns", "ping", "macros", "ed25519", "noise"] }
 libp2p-stream = "=0.5.0-alpha"
 rand = "0.8"
 serde = { version = "1", features = ["derive"] }

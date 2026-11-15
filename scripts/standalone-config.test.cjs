@@ -1,0 +1,20 @@
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+const test = require('node:test');
+test('standalone identity separates data/mutex and leaves installed URL/updater configuration alone', () => {
+  const root = path.resolve(__dirname, '..');
+  const base = JSON.parse(fs.readFileSync(path.join(root, 'src-tauri/tauri.conf.json'), 'utf8'));
+  const dev = JSON.parse(fs.readFileSync(path.join(root, 'src-tauri/tauri.standalone-dev.conf.json'), 'utf8'));
+  assert.notEqual(dev.identifier, base.identifier);
+  assert.equal(dev.identifier, 'app.dump.restart.dev20261115a');
+  assert.match(dev.productName, /Restart Dev/);
+  assert.equal(dev.build.devUrl, null);
+  assert.equal(dev.bundle.active, false);
+  assert.deepEqual(dev.plugins['deep-link'].desktop.schemes, []);
+  assert.equal(dev.plugins.updater, undefined);
+  assert.equal(dev.app.appDirectoriesOverride, undefined);
+  assert.equal(base.app.appDirectoriesOverride, undefined);
+  assert.equal(dev.app.windows[0].dataDirectory, undefined);
+  assert.deepEqual(base.plugins['deep-link'].desktop.schemes, ['dump']);
+});

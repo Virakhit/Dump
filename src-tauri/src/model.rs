@@ -43,10 +43,15 @@ fn encoded<T: Serialize>(value: &T) -> Result<Vec<u8>> {
     ciborium::into_writer(value, &mut bytes)?;
     Ok(bytes)
 }
-fn sign<T: Serialize>(key: &Keypair, value: &T) -> Result<String> {
+pub(crate) fn sign<T: Serialize>(key: &Keypair, value: &T) -> Result<String> {
     Ok(B64.encode(key.sign(&encoded(value)?)?))
 }
-fn verify<T: Serialize>(public: &str, peer: &str, signature: &str, value: &T) -> Result<()> {
+pub(crate) fn verify<T: Serialize>(
+    public: &str,
+    peer: &str,
+    signature: &str,
+    value: &T,
+) -> Result<()> {
     let key = decode_public(public)?;
     ensure!(
         key.to_peer_id().to_string() == peer,
@@ -237,6 +242,18 @@ pub struct LocalShare {
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Persisted {
+    #[serde(default)]
+    pub host_relay: std::collections::BTreeSet<Uuid>,
+    #[serde(default)]
+    pub shared_invites: BTreeMap<String, crate::invite_routes::SharedInvite>,
+    #[serde(default)]
+    pub routes: BTreeMap<String, crate::invite_routes::RouteRecord>,
+    #[serde(default)]
+    pub route_sequence: u64,
+    #[serde(default)]
+    pub joining_routes: Option<crate::invite_routes::RouteRecord>,
+    #[serde(default)]
+    pub chat: crate::chat::ChatState,
     pub version: u8,
     pub identity: String,
     pub device_name: String,
@@ -251,6 +268,12 @@ pub struct Persisted {
 impl Persisted {
     pub fn new() -> Result<Self> {
         Ok(Self {
+            chat: crate::chat::ChatState::default(),
+            host_relay: Default::default(),
+            shared_invites: BTreeMap::new(),
+            routes: BTreeMap::new(),
+            route_sequence: 0,
+            joining_routes: None,
             version: VERSION,
             identity: B64.encode(Keypair::generate_ed25519().to_protobuf_encoding()?),
             device_name: "My device".into(),

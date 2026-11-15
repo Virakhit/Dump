@@ -5,7 +5,7 @@ use crate::{
 use tauri::{Emitter, Manager};
 use tauri_plugin_deep_link::DeepLinkExt;
 use tauri_plugin_dialog::DialogExt;
-use tauri_plugin_updater::{Update, UpdaterExt};
+
 use uuid::Uuid;
 
 struct Desktop {
@@ -13,43 +13,19 @@ struct Desktop {
     node: Node,
 }
 
-#[derive(Default)]
-struct Updates(tokio::sync::Mutex<Option<Update>>);
-
 #[derive(Clone, serde::Serialize)]
 struct UpdateProgress {
     downloaded: u64,
     total: Option<u64>,
 }
 
+// No updater plugin/client or cached Update is registered in this rebuild.
 #[tauri::command]
-async fn check_update(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, Updates>,
-) -> Result<Option<String>, String> {
-    let mut cached = state.0.lock().await;
-    *cached = None;
-    let mut update = app
-        .updater_builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .map_err(|e| e.to_string())?
-        .check()
-        .await
-        .map_err(|e| {
-            format!(
-                "Could not check for updates. Check your internet connection and try again. {e}"
-            )
-        })?;
-    if let Some(update) = &mut update {
-        // The offline WebView2 installer makes this a large download on slower connections.
-        update.timeout = Some(std::time::Duration::from_secs(15 * 60));
-    }
-    let version = update.as_ref().map(|u| u.version.clone());
-    *cached = update;
-    Ok(version)
+async fn check_update() -> Result<Option<String>, String> {
+    crate::update_policy::check()
 }
 
+#[cfg(test)]
 fn update_ready(engine: &Engine) -> Result<(), String> {
     if !engine.preparing.is_empty()
         || engine
@@ -79,6 +55,7 @@ mod tests {
         engine.transfers.insert(
             id,
             engine::Transfer {
+                via_host: false,
                 id,
                 file_id: id,
                 name: "file".into(),
@@ -103,35 +80,11 @@ mod tests {
 
 #[tauri::command]
 async fn install_update(
-    state: tauri::State<'_, Updates>,
-    desktop: tauri::State<'_, Desktop>,
     version: String,
     on_progress: tauri::ipc::Channel<UpdateProgress>,
 ) -> Result<(), String> {
-    update_ready(&*desktop.shared.lock().await)?;
-    let mut cached = state.0.lock().await;
-    let update = cached
-        .as_ref()
-        .filter(|u| u.version == version)
-        .ok_or("Check for updates again before installing.")?;
-    let mut downloaded = 0;
-    // The platform updater verifies the pinned signing key before returning these bytes.
-    let bytes = update
-        .download(
-            |length, total| {
-                downloaded += length as u64;
-                let _ = on_progress.send(UpdateProgress { downloaded, total });
-            },
-            || {},
-        )
-        .await
-        .map_err(|e| format!("Update download or signature verification failed: {e}"))?;
-    update_ready(&*desktop.shared.lock().await)?;
-    update
-        .install(bytes)
-        .map_err(|e| format!("Could not start the update installer: {e}"))?;
-    *cached = None;
-    Ok(())
+    let _ = (version, on_progress);
+    crate::update_policy::install()
 }
 
 #[tauri::command]
@@ -139,8 +92,28 @@ async fn get_state(state: tauri::State<'_, Desktop>) -> Result<View, String> {
     Ok(state.shared.lock().await.view())
 }
 #[tauri::command]
+async fn send_chat(
+    state: tauri::State<'_, Desktop>,
+    workspace: Uuid,
+    body: String,
+) -> Result<Uuid, String> {
+    state
+        .node
+        .send_chat(workspace, body)
+        .await
+        .map_err(|e| e.to_string())
+}
+#[tauri::command]
 async fn dispatch(state: tauri::State<'_, Desktop>, action: Action) -> Result<(), String> {
-    engine::dispatch(&mut *state.shared.lock().await, action).map_err(|e| e.to_string())
+    if matches!(action, Action::CreateInvite) {
+        state
+            .node
+            .create_shared_invite()
+            .await
+            .map_err(|e| e.to_string())
+    } else {
+        engine::dispatch(&mut *state.shared.lock().await, action).map_err(|e| e.to_string())
+    }
 }
 #[tauri::command]
 async fn choose_share_files(
@@ -234,8 +207,6 @@ pub fn run() {
         }))
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_updater::Builder::new().build())
-        .manage(Updates::default())
         .setup(|app| {
             let handle = app.handle().clone();
             let shared = Engine::open(
@@ -263,6 +234,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             get_state,
+            send_chat,
             dispatch,
             choose_share_files,
             share_dropped_files,

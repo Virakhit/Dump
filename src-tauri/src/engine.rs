@@ -1,3 +1,4 @@
+use crate::chat::{ChatMessage, Delivery, DeliveryStatus, StoredChat};
 use crate::{model::*, storage::Store};
 use anyhow::{ensure, Context, Result};
 use libp2p::identity::Keypair;
@@ -16,6 +17,8 @@ use uuid::Uuid;
 
 pub type Shared = Arc<Mutex<Engine>>;
 pub type Notify = Arc<dyn Fn(View) + Send + Sync>;
+#[path = "engine_invites.rs"]
+mod invitations;
 
 #[derive(Clone, Serialize)]
 pub struct Pending {
@@ -41,6 +44,7 @@ pub struct WorkspaceView {
 }
 #[derive(Debug, Clone, Serialize)]
 pub struct Transfer {
+    pub via_host: bool,
     pub id: Uuid,
     pub file_id: Uuid,
     pub name: String,
@@ -53,6 +57,15 @@ pub struct Transfer {
 }
 #[derive(Clone, Serialize)]
 pub struct View {
+    pub updater_enabled: bool,
+    pub host_relay_enabled: bool,
+    pub host_relay_ready: bool,
+    pub host_relay_sessions: usize,
+    pub host_file_sources: Vec<String>,
+    pub join_stage: Option<&'static str>,
+    pub join_owner_fingerprint: Option<String>,
+    pub invite_note: Option<String>,
+    pub chat_messages: Vec<StoredChat>,
     pub peer_id: String,
     pub fingerprint: String,
     pub device_name: String,
@@ -70,6 +83,14 @@ pub struct View {
 }
 
 pub struct Engine {
+    pub(crate) relay_cancel: CancellationToken,
+    pub(crate) relay_active: Arc<std::sync::atomic::AtomicUsize>,
+    pub(crate) relay_host_generation: Option<Uuid>,
+    pub(crate) relay_peers: std::collections::BTreeSet<String>,
+    pub(crate) join_contacting: bool,
+    pub(crate) join_acknowledged: Option<String>,
+    pub(crate) invite_note: Option<String>,
+    pub(crate) chat_cancel: CancellationToken,
     pub persisted: Persisted,
     pub key: Keypair,
     pub store: Store,
@@ -89,6 +110,13 @@ impl Engine {
     pub fn open(directory: &Path, notify: Notify) -> Result<Shared> {
         let store = Store::new(directory)?;
         let mut persisted = store.load()?;
+        for entry in &mut persisted.chat.messages {
+            if let Some(delivery) = &mut entry.delivery {
+                if delivery.status == DeliveryStatus::Sending {
+                    delivery.status = DeliveryStatus::Interrupted;
+                }
+            }
+        }
         persisted.partials.retain(|partial| {
             // Only recorded, UUID-named Dump partials are eligible for startup cleanup.
             if partial
@@ -104,6 +132,14 @@ impl Engine {
         store.save(&persisted)?;
         let key = persisted.key()?;
         Ok(Arc::new(Mutex::new(Self {
+            relay_cancel: CancellationToken::new(),
+            relay_active: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            relay_host_generation: None,
+            relay_peers: Default::default(),
+            join_contacting: false,
+            join_acknowledged: None,
+            invite_note: None,
+            chat_cancel: CancellationToken::new(),
             persisted,
             key,
             store,
@@ -186,6 +222,47 @@ impl Engine {
         );
         files.sort_by(|a, b| a.manifest.name.cmp(&b.manifest.name));
         View {
+            updater_enabled: crate::update_policy::ENABLED,
+            host_relay_enabled: self
+                .persisted
+                .active
+                .is_some_and(|room| self.persisted.host_relay.contains(&room))
+                && self
+                    .active_snapshot()
+                    .is_ok_and(|snapshot| snapshot.owner_peer_id == peer),
+            host_relay_ready: self.relay_host_generation.is_some(),
+            host_relay_sessions: self.relay_active.load(std::sync::atomic::Ordering::Acquire),
+            host_file_sources: self.relay_peers.iter().cloned().collect(),
+            join_stage: self.persisted.joining.as_ref().map(|invite| {
+                if self.join_acknowledged.as_deref()
+                    == Some(digest(invite.token.as_bytes()).as_str())
+                {
+                    "awaiting_approval"
+                } else if self.join_contacting {
+                    "connecting"
+                } else {
+                    "finding_owner"
+                }
+            }),
+            join_owner_fingerprint: self
+                .persisted
+                .joining_routes
+                .as_ref()
+                .map(|record| {
+                    decode_public(&record.public_key).map(|key| digest(&key.encode_protobuf()))
+                })
+                .transpose()
+                .ok()
+                .flatten(),
+            invite_note: self.invite_note.clone(),
+            chat_messages: self
+                .persisted
+                .chat
+                .messages
+                .iter()
+                .filter(|entry| Some(entry.message.workspace_id) == self.persisted.active)
+                .cloned()
+                .collect(),
             peer_id: peer.clone(),
             fingerprint: digest(&self.key.public().encode_protobuf()),
             device_name: self.persisted.device_name.clone(),
@@ -214,6 +291,97 @@ impl Engine {
             invite_url: self.invite_url.clone(),
             last_error: self.last_error.clone(),
         }
+    }
+    /// Save locally before any network operation; the counters describe recipients,
+    /// not delivery. Acknowledgments are recorded only by finish_chat.
+    pub fn compose_chat(
+        &mut self,
+        workspace: Uuid,
+        body: String,
+        attempted: usize,
+        offline: usize,
+    ) -> Result<ChatMessage> {
+        let snapshot = self.active_snapshot()?;
+        ensure!(
+            snapshot.workspace_id == workspace && snapshot.contains(&self.peer()),
+            "Choose an authorized workspace before sending"
+        );
+        ensure!(
+            attempted.saturating_add(offline) == snapshot.members.len() - 1,
+            "Chat recipient set changed"
+        );
+        let mut next = self.persisted.clone();
+        let sequence = next.chat.next_sequence(workspace)?;
+        let message = ChatMessage::new(&self.key, workspace, snapshot.revision, sequence, body)?;
+        next.chat.append(StoredChat {
+            message: message.clone(),
+            sender_name: next.device_name.clone(),
+            delivery: Some(Delivery {
+                status: DeliveryStatus::Sending,
+                attempted,
+                acknowledged: 0,
+                offline,
+            }),
+        });
+        self.persist(next)?;
+        self.emit();
+        Ok(message)
+    }
+    pub fn finish_chat(&mut self, id: Uuid, acknowledged: usize, interrupted: bool) -> Result<()> {
+        let own_peer = self.peer();
+        let mut next = self.persisted.clone();
+        let delivery = next
+            .chat
+            .messages
+            .iter_mut()
+            .find(|entry| entry.message.id == id && entry.message.sender_peer_id == own_peer)
+            .and_then(|entry| entry.delivery.as_mut())
+            .context("Chat history no longer contains this send")?;
+        ensure!(
+            acknowledged <= delivery.attempted && delivery.status == DeliveryStatus::Sending,
+            "Invalid chat completion"
+        );
+        delivery.acknowledged = acknowledged;
+        delivery.status = if interrupted {
+            DeliveryStatus::Interrupted
+        } else {
+            DeliveryStatus::Complete
+        };
+        self.persist(next)?;
+        self.emit();
+        Ok(())
+    }
+    pub fn receive_chat(
+        &mut self,
+        peer: &str,
+        snapshot: &Snapshot,
+        message: ChatMessage,
+    ) -> Result<()> {
+        message.verify_incoming()?;
+        ensure!(
+            message.sender_peer_id == peer
+                && message.workspace_id == snapshot.workspace_id
+                && message.roster_revision == snapshot.revision,
+            "Chat sender or workspace mismatch"
+        );
+        let current = self.authorize(peer, snapshot)?;
+        ensure!(
+            current.revision == message.roster_revision,
+            "Stale chat membership"
+        );
+        let name = current
+            .members
+            .iter()
+            .find(|member| member.peer_id == peer)
+            .context("Chat sender is not a member")?
+            .name
+            .clone();
+        let mut next = self.persisted.clone();
+        if next.chat.record_received(message, name)? {
+            self.persist(next)?;
+            self.emit();
+        }
+        Ok(())
     }
     pub fn create_workspace(&mut self, name: String) -> Result<()> {
         validate_label(&name)?;
@@ -270,6 +438,15 @@ impl Engine {
         Ok(())
     }
     pub(crate) fn reset_runtime(&mut self) {
+        self.relay_cancel.cancel();
+        self.relay_cancel = CancellationToken::new();
+        self.relay_host_generation = None;
+        self.relay_peers.clear();
+        self.join_contacting = false;
+        self.join_acknowledged = None;
+        self.invite_note = None;
+        self.chat_cancel.cancel();
+        self.chat_cancel = CancellationToken::new();
         for token in self.cancellations.values() {
             token.cancel();
         }
@@ -287,7 +464,7 @@ impl Engine {
         let mut next = self.persisted.clone();
         next.invites.retain(|i| i.expires_at > now());
         ensure!(
-            next.invites.len() < 128,
+            next.invites.len() + next.shared_invites.len() < 128,
             "Too many invitations; wait for old ones to expire"
         );
         next.invites.push(InviteRecord {
@@ -309,7 +486,11 @@ impl Engine {
         Ok(url)
     }
     pub fn join(&mut self, value: &str) -> Result<()> {
-        let invite = Invitation::parse(value)?;
+        let input = crate::invite_routes::JoinInput::parse(value)?;
+        if let Some(record) = &input.routes {
+            record.verify_at(now())?;
+        }
+        let invite = input.invitation;
         ensure!(
             invite.owner_peer_id != self.peer(),
             "This is your own invitation"
@@ -322,14 +503,20 @@ impl Engine {
         }
         let mut next = self.persisted.clone();
         next.joining = Some(invite);
+        next.joining_routes = input.routes;
         self.persist(next)?;
+        self.join_contacting = false;
+        self.join_acknowledged = None;
         self.emit();
         Ok(())
     }
     pub fn cancel_join(&mut self) -> Result<()> {
         let mut next = self.persisted.clone();
         next.joining = None;
+        next.joining_routes = None;
         self.persist(next)?;
+        self.join_contacting = false;
+        self.join_acknowledged = None;
         self.emit();
         Ok(())
     }
@@ -353,17 +540,30 @@ impl Engine {
             "Not the workspace owner"
         );
         let mut next = self.persisted.clone();
-        let invite = next
-            .invites
-            .iter_mut()
-            .find(|i| {
-                i.workspace_id == snapshot.workspace_id
-                    && i.token_hash == pending.token_hash
-                    && i.expires_at > now()
-                    && i.approved_peer.is_none()
-            })
-            .context("Invitation expired or already used")?;
-        invite.approved_peer = Some(peer.into());
+        if let Some(invite) = next.invites.iter_mut().find(|i| {
+            i.workspace_id == snapshot.workspace_id
+                && i.token_hash == pending.token_hash
+                && i.expires_at > now()
+                && i.approved_peer.is_none()
+        }) {
+            invite.approved_peer = Some(peer.into());
+        } else {
+            let invite = next
+                .shared_invites
+                .get_mut(&pending.token_hash)
+                .context("Invitation expired or already used")?;
+            ensure!(
+                invite.workspace_id == snapshot.workspace_id
+                    && invite.expires_at > now()
+                    && !invite.rejected.contains(peer),
+                "Invitation expired or device was rejected"
+            );
+            ensure!(
+                invite.approved.len() < MAX_MEMBERS,
+                "Invitation approval limit reached"
+            );
+            invite.approved.insert(peer.into());
+        }
         if !snapshot.contains(peer) {
             snapshot.members.push(Member {
                 peer_id: peer.into(),
@@ -392,11 +592,21 @@ impl Engine {
             .context("Join request not found")?
             .clone();
         ensure!(
-            self.active_snapshot()?.owner_peer_id == self.peer(),
+            self.active_snapshot()?.owner_peer_id == self.peer()
+                && self.persisted.active == Some(pending.workspace_id),
             "Only the owner can reject requests"
         );
         let mut next = self.persisted.clone();
-        next.invites.retain(|i| i.token_hash != pending.token_hash);
+        if let Some(invite) = next.shared_invites.get_mut(&pending.token_hash) {
+            ensure!(
+                invite.rejected.len() < MAX_MEMBERS,
+                "Revoke this invitation before rejecting more devices"
+            );
+            invite.approved.remove(peer);
+            invite.rejected.insert(peer.into());
+        } else {
+            next.invites.retain(|i| i.token_hash != pending.token_hash);
+        }
         self.persist(next)?;
         self.pending.remove(peer);
         self.emit();
@@ -420,6 +630,12 @@ impl Engine {
         next.workspaces.get_mut(&workspace_id).unwrap().snapshot = snapshot;
         next.invites
             .retain(|i| i.approved_peer.as_deref() != Some(peer));
+        next.shared_invites.retain(|_, invite| {
+            if invite.workspace_id == workspace_id && invite.approved.remove(peer) {
+                invite.rejected.insert(peer.into());
+            }
+            invite.rejected.len() <= MAX_MEMBERS
+        });
         next.audit("member-removed", next.active.unwrap(), peer);
         self.persist(next)?;
         self.reconcile();
@@ -484,6 +700,12 @@ impl Engine {
         Ok(current)
     }
     pub fn reconcile(&mut self) {
+        self.relay_cancel.cancel();
+        self.relay_cancel = CancellationToken::new();
+        self.relay_host_generation = None;
+        // Membership changes interrupt old fan-out; every future send takes a new roster.
+        self.chat_cancel.cancel();
+        self.chat_cancel = CancellationToken::new();
         let allowed = self
             .active_snapshot()
             .ok()
@@ -567,6 +789,7 @@ impl Engine {
         self.transfers.insert(
             id,
             Transfer {
+                via_host: false,
                 id,
                 file_id: manifest.file_id,
                 name: manifest.name.clone(),
@@ -786,6 +1009,8 @@ pub enum Action {
     Activate { id: Uuid },
     SetName { name: String },
     CreateInvite,
+    SetHostRelay { enabled: bool },
+    RevokeInvite,
     Join { invite: String },
     CancelJoin,
     Approve { peer_id: String },
@@ -801,6 +1026,8 @@ pub fn dispatch(engine: &mut Engine, action: Action) -> Result<()> {
         Action::Activate { id } => engine.activate(id),
         Action::SetName { name } => engine.set_name(name),
         Action::CreateInvite => engine.create_invite().map(|_| ()),
+        Action::SetHostRelay { enabled } => engine.set_host_relay(enabled),
+        Action::RevokeInvite => engine.revoke_current_invite(),
         Action::Join { invite } => engine.join(&invite),
         Action::CancelJoin => engine.cancel_join(),
         Action::Approve { peer_id } => engine.approve(&peer_id),

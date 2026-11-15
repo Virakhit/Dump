@@ -1,0 +1,30 @@
+{
+  "productName": "Dump Restart Dev",
+  "identifier": "app.dump.restart.dev20261115a",
+  "build": {
+    "devUrl": null
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Dump Restart Dev - isolated profile",
+        "width": 1100,
+        "height": 780,
+        "minWidth": 760,
+        "minHeight": 580,
+        "dragDropEnabled": true
+      }
+    ]
+  },
+  "bundle": {
+    "active": false
+  },
+  "plugins": {
+    "deep-link": {
+      "desktop": {
+        "schemes": []
+      }
+    }
+  }
+}

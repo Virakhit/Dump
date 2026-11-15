@@ -31,10 +31,23 @@ impl Store {
         for workspace in state.workspaces.values() {
             workspace.snapshot.verify()?;
         }
+        state
+            .chat
+            .validate_for(&state.peer_id()?, &state.workspaces)?;
+        crate::invite_routes::validate_persisted(&state)?;
+        let own_peer = state.peer_id()?;
+        ensure!(
+            state.host_relay.iter().all(|id| state
+                .workspaces
+                .get(id)
+                .is_some_and(|workspace| workspace.snapshot.owner_peer_id == own_peer)),
+            "Relay settings are outside owned workspaces"
+        );
         Ok(state)
     }
     pub fn save(&self, state: &Persisted) -> Result<()> {
         let bytes = protect(&serde_json::to_vec(state)?)?;
+        ensure!(bytes.len() <= 32 * 1024 * 1024, "Local state is too large");
         let temporary = self.path.with_extension("new");
         let mut file = fs::OpenOptions::new()
             .write(true)
